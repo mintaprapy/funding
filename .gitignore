@@ -9,5 +9,7 @@ funding.db-shm
 funding.db-wal
 
 *.log
+.run_all_funding_stack.lock
+funding_dashboard_static.html
 
 .DS_Store
