@@ -7,8 +7,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
+User=root
+Group=root
 WorkingDirectory=/srv/funding
 Environment=PYTHONUNBUFFERED=1
 Environment=FUNDING_DB_PATH=/srv/funding/funding.db

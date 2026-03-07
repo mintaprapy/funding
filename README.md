@@ -232,8 +232,8 @@ sudo systemctl daemon-reload
 ```
 
 按服务器实际情况修改这些字段：
-- `User`
-- `Group`
+- `User`（模板默认值：`root`）
+- `Group`（模板默认值：`root`）
 - `WorkingDirectory`
 - `Environment=FUNDING_DB_PATH=...`
 - `ExecStart`
@@ -283,8 +283,8 @@ sudo journalctl -u funding-stack -f
 ```
 
 启用前请按服务器实际情况修改以下字段：
-- `User`
-- `Group`
+- `User`（模板默认值：`root`）
+- `Group`（模板默认值：`root`）
 - `WorkingDirectory`
 - `Environment=FUNDING_DB_PATH=...`
 - `ExecStart`
