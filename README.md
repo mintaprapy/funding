@@ -29,13 +29,52 @@ pip install -U pip requests
 ```
 
 ## 3. 目录与入口
-- 一键启动入口：`start_all_funding.sh`
-- 主调度器：`run_all_funding_stack.py`
-- 网页面板：`allfunding_dashboard.py`
-- 交易所共享配置：`funding_exchanges.py`
-- 长时监督压测：`long_run_supervisor.py`
-- 定期健康巡检（可选）：`periodic_health_monitor.py`
-- 数据库文件：`funding.db`
+- Shell 启动入口：`start_all_funding.sh`
+- 应用入口目录：`app/`
+- 公共模块目录：`core/`
+- 交易所采集脚本目录：`exchanges/`
+- systemd 模板目录：`systemd/`
+- 运行数据库：`funding.db`
+- 运行日志目录：`logs/`
+
+当前仓库根目录只保留 shell 入口、部署文件和文档；Python 代码已按职责拆到 `app/`、`core/`、`exchanges/`，GitHub 首页会明显更干净。
+
+简化后的结构如下：
+
+```text
+Funding/
+├── README.md
+├── DEPLOY_DAY_CHECKLIST.md
+├── start_all_funding.sh
+├── app/
+│   ├── __init__.py
+│   ├── run_all_funding_stack.py
+│   └── allfunding_dashboard.py
+├── core/
+│   ├── __init__.py
+│   ├── funding_exchanges.py
+│   └── common_funding.py
+├── exchanges/
+│   ├── bincance_funding/
+│   ├── bybit_funding/
+│   ├── aster_funding/
+│   ├── hyperliquid_funding/
+│   ├── backpack_funding/
+│   ├── ethereal_funding/
+│   ├── grvt_funding/
+│   ├── standx_funding/
+│   └── lighter_funding/
+├── logs/
+├── funding.db
+└── systemd/
+```
+
+职责说明：
+- `app/`：总调度器和总 dashboard 的入口模块
+- `core/`：公共 SQLite、限速、交易所注册表等共享代码
+- `exchanges/`：各交易所的 `baseinfo`、`history`、单交易所 dashboard
+- `systemd/`：线上部署用服务模板
+- `start_all_funding.sh`：面向人工执行的统一入口
 
 ## 4. 一键启动（推荐）
 在项目根目录执行：
@@ -57,11 +96,17 @@ pip install -U pip requests
 nohup ./start_all_funding.sh --no-open-browser --host 0.0.0.0 --port 5000 > /tmp/funding_stack.log 2>&1 &
 ```
 
+也可以直接使用模块入口：
+
+```bash
+python3 -m app.run_all_funding_stack --no-open-browser --host 0.0.0.0 --port 5000
+```
+
 ## 5. 常用参数
 查看全部参数：
 
 ```bash
-python3 run_all_funding_stack.py --help
+python3 -m app.run_all_funding_stack --help
 ```
 
 常用参数：
@@ -74,64 +119,32 @@ python3 run_all_funding_stack.py --help
 - `--script-retry-wait 5`
 - `--lock-file .run_all_funding_stack.lock`（单实例锁文件）
 
-## 6. 5 小时后台压测运行
-用于“全量后台压测 + 失败统计”：
+常见调试命令：
 
 ```bash
-python3 long_run_supervisor.py --duration-hours 5 --until-clean --max-rounds 8 --no-open-browser
+python3 -m app.allfunding_dashboard --host 127.0.0.1 --port 5000
+python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 ```
 
-输出文件：
-- 轮次日志：`/tmp/funding_supervisor_round*.log`
-- 汇总结果：`/tmp/funding_supervisor_summary.json`
-
-## 7. 健康巡检（可选）
-该脚本会定期检查：
-- 核心进程是否存在
-- 数据库关键字段是否为空
-- 最新监督日志是否出现失败关键字
-
-前台运行：
-
-```bash
-python3 periodic_health_monitor.py --db funding.db --log-dir /tmp --interval-sec 600
-```
-
-后台运行：
-
-```bash
-nohup python3 periodic_health_monitor.py --db funding.db --log-dir /tmp --interval-sec 600 > /tmp/funding_periodic_monitor.log 2>&1 &
-```
-
-注意：该巡检脚本默认期望 `long_run_supervisor.py`、`run_all_funding_stack.py`、`allfunding_dashboard.py` 三个进程都在运行。
-
-## 8. 停止服务
+## 6. 停止服务
 停止主调度/面板：
 
 ```bash
-pkill -f run_all_funding_stack.py
-pkill -f allfunding_dashboard.py
-pkill -f long_run_supervisor.py
+pkill -f app.run_all_funding_stack
+pkill -f app.allfunding_dashboard
 ```
 
-停止巡检：
-
-```bash
-pkill -f periodic_health_monitor.py
-```
-
-## 9. 快速自检命令
+## 7. 快速自检命令
 查看关键进程：
 
 ```bash
-ps -Ao pid,etime,command | grep -E 'run_all_funding_stack.py|allfunding_dashboard.py|long_run_supervisor.py' | grep -v grep
+ps -Ao pid,etime,command | grep -E 'app.run_all_funding_stack|app.allfunding_dashboard' | grep -v grep
 ```
 
-查看监督日志中的失败关键词：
+检查总面板接口：
 
 ```bash
-latest=$(ls -t /tmp/funding_supervisor_round*.log | head -n 1)
-grep -nE '\[fail\]|脚本失败|Traceback|ERROR' "$latest"
+curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]))'
 ```
 
 检查 9 家交易所 `baseinfo` 关键字段空值：
@@ -158,7 +171,7 @@ SELECT 'lighter',  SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 
 "
 ```
 
-## 10. 部署建议（Linux）
+## 8. 部署建议（Linux）
 当前项目依赖极少，建议优先“直接在 Linux 服务器运行”：
 - 部署简单
 - 进程与日志排查方便
@@ -169,31 +182,55 @@ SELECT 'lighter',  SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 
 - 需要 CI/CD 镜像发布
 - 需要容器编排（如 Kubernetes）
 
-## 11. 服务器部署命令
-以下示例假设项目部署目录为 `/srv/funding`。
+## 9. GitHub 首页部署步骤
+下面这套命令按顺序执行即可，适合直接放到服务器上从 GitHub 拉代码部署。
 
-安装依赖：
+### 9.1 拉取代码
+SSH 方式：
 
 ```bash
-cd /srv/funding
+cd /srv
+git clone git@github.com:mintaprapy/funding.git
+cd funding
+```
+
+HTTPS 方式：
+
+```bash
+cd /srv
+git clone https://github.com/mintaprapy/funding.git
+cd funding
+```
+
+### 9.2 安装依赖
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip requests
 ```
 
-首次空库预热一轮：
+### 9.3 首次空库预热
+首次部署建议先跑一轮空库预热，确认采集链路和数据库都正常：
 
 ```bash
-cd /srv/funding
 source .venv/bin/activate
-python run_all_funding_stack.py --once --no-open-browser --host 0.0.0.0 --port 5000
+python -m app.run_all_funding_stack --once --no-open-browser --host 0.0.0.0 --port 5000
 ```
 
-正式后台运行：
+### 9.4 直接前台启动
+如果你只是临时验证，可以先前台启动：
 
 ```bash
-cd /srv/funding
-nohup ./.venv/bin/python run_all_funding_stack.py \
+source .venv/bin/activate
+python -m app.run_all_funding_stack --no-open-browser --host 0.0.0.0 --port 5000
+```
+
+### 9.5 后台启动
+如果暂时不用 `systemd`，也可以直接后台运行：
+
+```bash
+nohup ./.venv/bin/python -m app.run_all_funding_stack \
   --no-open-browser \
   --host 0.0.0.0 \
   --port 5000 \
@@ -203,8 +240,7 @@ nohup ./.venv/bin/python run_all_funding_stack.py \
 如果数据库需要放到单独可写目录：
 
 ```bash
-cd /srv/funding
-nohup ./.venv/bin/python run_all_funding_stack.py \
+nohup ./.venv/bin/python -m app.run_all_funding_stack \
   --no-open-browser \
   --host 0.0.0.0 \
   --port 5000 \
@@ -212,20 +248,59 @@ nohup ./.venv/bin/python run_all_funding_stack.py \
   > /tmp/funding_stack.log 2>&1 &
 ```
 
-上线后验收：
+### 9.6 后续更新代码
+服务器上后续更新代码时，直接执行：
 
 ```bash
-ps -Ao pid,etime,command | grep -E 'run_all_funding_stack.py|allfunding_dashboard.py' | grep -v grep
+cd /srv/funding
+git pull
+source .venv/bin/activate
+pip install -U pip requests
+```
+
+如果你是前台/后台直接运行：
+
+```bash
+pkill -f app.run_all_funding_stack
+pkill -f app.allfunding_dashboard
+nohup ./.venv/bin/python -m app.run_all_funding_stack \
+  --no-open-browser \
+  --host 0.0.0.0 \
+  --port 5000 \
+  > /tmp/funding_stack.log 2>&1 &
+```
+
+如果你是 `systemd` 部署：
+
+```bash
+sudo systemctl restart funding-stack
+```
+
+### 9.7 上线后验收
+
+```bash
+ps -Ao pid,etime,command | grep -E 'app.run_all_funding_stack|app.allfunding_dashboard' | grep -v grep
 curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x[\"items\"]), len(x[\"exchanges\"]))'
+```
+
+如果你是 `nohup` 后台启动：
+
+```bash
 grep -nE '\[error\]|\[warn\].*exited with code|Traceback' /tmp/funding_stack.log
+```
+
+如果你是 `systemd` 启动：
+
+```bash
+sudo journalctl -u funding-stack -n 200 --no-pager
 ```
 
 说明：
 - 首次空库全量回填耗时较长，属于正常现象。
 - 健康检查不要使用 `HEAD /`，建议使用 `GET /` 或 `GET /api/data`。
-- 如果线上不运行 `long_run_supervisor.py`，则不建议直接依赖 `periodic_health_monitor.py` 的进程告警结果。
+- 单个交易所脚本也可以直接运行，路径统一位于 `exchanges/<exchange>/`。
 
-## 12. systemd 服务
+## 10. systemd 服务
 项目内已提供主服务模板：[systemd/funding-stack.service](/Users/m2/Desktop/Codex2026/Funding/systemd/funding-stack.service)
 
 安装步骤：
