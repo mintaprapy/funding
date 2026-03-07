@@ -260,7 +260,7 @@ sudo systemctl restart funding-stack
 
 ```bash
 ps -Ao pid,etime,command | grep -E 'app.run_all_funding_stack|app.allfunding_dashboard' | grep -v grep
-curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x[\"items\"]), len(x[\"exchanges\"]))'
+curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]))'
 sudo journalctl -u funding-stack -n 200 --no-pager
 ```
 
