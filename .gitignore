@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+funding.db
+funding.db-shm
+funding.db-wal
+
+*.log
+
+.DS_Store

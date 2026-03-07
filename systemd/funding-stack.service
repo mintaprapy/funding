@@ -1,0 +1,22 @@
+# Adjust User, Group, WorkingDirectory, FUNDING_DB_PATH, and ExecStart before installing.
+
+[Unit]
+Description=Funding stack scheduler and dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/funding
+Environment=PYTHONUNBUFFERED=1
+Environment=FUNDING_DB_PATH=/srv/funding/funding.db
+ExecStart=/srv/funding/.venv/bin/python /srv/funding/run_all_funding_stack.py --no-open-browser --host 0.0.0.0 --port 5000 --db-path /srv/funding/funding.db
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
