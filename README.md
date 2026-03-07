@@ -184,6 +184,7 @@ SELECT 'lighter',  SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 
 
 ## 9. GitHub 首页部署步骤
 下面这套命令按顺序执行即可，适合直接放到服务器上从 GitHub 拉代码部署。
+建议优先走这条路径：`git clone -> 安装依赖 -> 先跑一次 --once -> systemd 启动`。
 
 ### 9.1 拉取代码
 SSH 方式：
@@ -218,37 +219,33 @@ source .venv/bin/activate
 python -m app.run_all_funding_stack --once --no-open-browser --host 0.0.0.0 --port 5000
 ```
 
-### 9.4 直接前台启动
-如果你只是临时验证，可以先前台启动：
+说明：
+- 这一步建议保留，不要跳过
+- 首次空库全量回填耗时较长，属于正常现象
+
+### 9.4 用 systemd 启动（推荐）
+先安装服务文件：
 
 ```bash
-source .venv/bin/activate
-python -m app.run_all_funding_stack --no-open-browser --host 0.0.0.0 --port 5000
+sudo cp systemd/funding-stack.service /etc/systemd/system/funding-stack.service
+sudo systemctl daemon-reload
 ```
 
-### 9.5 后台启动
-如果暂时不用 `systemd`，也可以直接后台运行：
+按服务器实际情况修改这些字段：
+- `User`
+- `Group`
+- `WorkingDirectory`
+- `Environment=FUNDING_DB_PATH=...`
+- `ExecStart`
+
+然后启动：
 
 ```bash
-nohup ./.venv/bin/python -m app.run_all_funding_stack \
-  --no-open-browser \
-  --host 0.0.0.0 \
-  --port 5000 \
-  > /tmp/funding_stack.log 2>&1 &
+sudo systemctl enable --now funding-stack
+sudo systemctl status funding-stack
 ```
 
-如果数据库需要放到单独可写目录：
-
-```bash
-nohup ./.venv/bin/python -m app.run_all_funding_stack \
-  --no-open-browser \
-  --host 0.0.0.0 \
-  --port 5000 \
-  --db-path /data/funding/funding.db \
-  > /tmp/funding_stack.log 2>&1 &
-```
-
-### 9.6 后续更新代码
+### 9.5 后续更新代码
 服务器上后续更新代码时，直接执行：
 
 ```bash
@@ -256,47 +253,18 @@ cd /srv/funding
 git pull
 source .venv/bin/activate
 pip install -U pip requests
-```
-
-如果你是前台/后台直接运行：
-
-```bash
-pkill -f app.run_all_funding_stack
-pkill -f app.allfunding_dashboard
-nohup ./.venv/bin/python -m app.run_all_funding_stack \
-  --no-open-browser \
-  --host 0.0.0.0 \
-  --port 5000 \
-  > /tmp/funding_stack.log 2>&1 &
-```
-
-如果你是 `systemd` 部署：
-
-```bash
 sudo systemctl restart funding-stack
 ```
 
-### 9.7 上线后验收
+### 9.6 上线后验收
 
 ```bash
 ps -Ao pid,etime,command | grep -E 'app.run_all_funding_stack|app.allfunding_dashboard' | grep -v grep
 curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x[\"items\"]), len(x[\"exchanges\"]))'
-```
-
-如果你是 `nohup` 后台启动：
-
-```bash
-grep -nE '\[error\]|\[warn\].*exited with code|Traceback' /tmp/funding_stack.log
-```
-
-如果你是 `systemd` 启动：
-
-```bash
 sudo journalctl -u funding-stack -n 200 --no-pager
 ```
 
 说明：
-- 首次空库全量回填耗时较长，属于正常现象。
 - 健康检查不要使用 `HEAD /`，建议使用 `GET /` 或 `GET /api/data`。
 - 单个交易所脚本也可以直接运行，路径统一位于 `exchanges/<exchange>/`。
 
