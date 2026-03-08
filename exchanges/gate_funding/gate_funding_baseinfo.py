@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from requests import RequestException
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
 if str(ROOT_DIR) not in sys.path:
@@ -29,7 +30,8 @@ BASE_URL = os.getenv("GATE_BASE_URL", "https://api.gateio.ws").rstrip("/")
 CONTRACTS_PATH = "/api/v4/futures/usdt/contracts"
 TICKERS_PATH = "/api/v4/futures/usdt/tickers"
 INSURANCE_PATH = "/api/v4/futures/usdt/insurance"
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 20
+MAX_HTTP_ATTEMPTS = 4
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "gate_funding_baseinfo"
@@ -40,9 +42,20 @@ WINDOW_CAPACITY = 600
 
 def gate_get(session: requests.Session, path: str, *, params: dict[str, Any] | None = None) -> Any:
     url = f"{BASE_URL}{path}"
-    resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
+        try:
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if resp.status_code >= 500:
+                raise RuntimeError(f"{path} http {resp.status_code}")
+            resp.raise_for_status()
+            return resp.json()
+        except (RequestException, RuntimeError) as exc:
+            last_exc = exc
+            if attempt >= MAX_HTTP_ATTEMPTS:
+                break
+            time.sleep(min(1.0 * attempt, 3.0))
+    raise RuntimeError(f"Gate 请求失败: {path}, err={last_exc}") from last_exc
 
 
 def fetch_contracts(session: requests.Session) -> dict[str, dict[str, Any]]:

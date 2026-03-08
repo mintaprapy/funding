@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from requests import RequestException
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
 if str(ROOT_DIR) not in sys.path:
@@ -27,7 +28,8 @@ from core.common_funding import (
 BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com").rstrip("/")
 CONTRACTS_PATH = "/api/v2/mix/market/contracts"
 TICKERS_PATH = "/api/v2/mix/market/tickers"
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 20
+MAX_HTTP_ATTEMPTS = 4
 
 PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
 
@@ -37,14 +39,28 @@ TABLE_NAME = "bitget_funding_baseinfo"
 
 def bitget_get(session: requests.Session, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
     url = f"{BASE_URL}{path}"
-    resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{path} 返回格式异常（非 dict）")
-    if str(data.get("code")) != "00000":
-        raise RuntimeError(f"{path} code={data.get('code')} msg={data.get('msg')}")
-    return data
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
+        try:
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if resp.status_code >= 500:
+                raise RuntimeError(f"{path} http {resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"{path} 返回格式异常（非 dict）")
+            code = str(data.get("code"))
+            if code != "00000":
+                if code in {"429", "40015", "40017", "30005"}:
+                    raise RuntimeError(f"{path} code={code} msg={data.get('msg')}")
+                raise RuntimeError(f"{path} code={code} msg={data.get('msg')}")
+            return data
+        except (RequestException, RuntimeError) as exc:
+            last_exc = exc
+            if attempt >= MAX_HTTP_ATTEMPTS:
+                break
+            time.sleep(min(1.0 * attempt, 3.0))
+    raise RuntimeError(f"Bitget 请求失败: {path}, err={last_exc}") from last_exc
 
 
 def fetch_contracts(session: requests.Session) -> dict[str, dict[str, Any]]:
