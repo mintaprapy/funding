@@ -1,9 +1,50 @@
 # Funding 面板项目说明
 
+## GitHub 首页快速部署
+
+### 如果是已有服务器更新
+
+```bash
+cd /srv/funding
+git pull
+source .venv/bin/activate
+pip install -U pip requests
+sudo cp systemd/funding-stack.service /etc/systemd/system/funding-stack.service
+sudo systemctl daemon-reload
+sudo systemctl restart funding-stack
+sudo systemctl status funding-stack
+```
+
+### 如果是首次部署
+
+```bash
+cd /srv
+git clone git@github.com:mintaprapy/funding.git
+cd funding
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip requests
+sudo cp systemd/funding-stack.service /etc/systemd/system/funding-stack.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now funding-stack
+sudo systemctl status funding-stack
+```
+
+### 上线后立刻验收
+
+```bash
+curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]))'
+sudo journalctl -u funding-stack -n 100 --no-pager
+```
+
+说明：
+- 如果你要只启用部分交易所，先编辑 [config/exchanges.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.json)
+- 更完整的部署说明见下文“GitHub 首页部署步骤”
+
 ## 1. 项目简介
 本项目用于采集多个交易所永续合约资金费率数据，并写入本地 SQLite 数据库，再通过内置网页面板展示。
 
-当前覆盖交易所（11 家）：
+当前覆盖交易所（13 家）：
 - Binance
 - Bybit
 - Aster
@@ -15,6 +56,8 @@
 - Lighter
 - Gate
 - Bitget
+- Variational
+- edgeX
 
 ## 2. 运行依赖
 依赖很轻量：
@@ -35,6 +78,7 @@ pip install -U pip requests
 - 应用入口目录：`app/`
 - 公共模块目录：`core/`
 - 交易所采集脚本目录：`exchanges/`
+- 启用交易所配置：`config/exchanges.json`
 - systemd 模板目录：`systemd/`
 - 运行数据库：`funding.db`
 - 运行日志目录：`logs/`
@@ -68,6 +112,8 @@ Funding/
 │   ├── lighter_funding/
 │   ├── gate_funding/
 │   └── bitget_funding/
+├── config/
+│   └── exchanges.json
 ├── logs/
 ├── funding.db
 └── systemd/
@@ -77,8 +123,28 @@ Funding/
 - `app/`：总调度器和总 dashboard 的入口模块
 - `core/`：公共 SQLite、限速、交易所注册表等共享代码
 - `exchanges/`：各交易所的 `baseinfo`、`history`、单交易所 dashboard
+- `config/exchanges.json`：控制启动时启用哪些交易所
 - `systemd/`：线上部署用服务模板
 - `start_all_funding.sh`：面向人工执行的统一入口
+
+启动链路：
+- `start_all_funding.sh`
+- `python3 -m app.run_all_funding_stack`
+- `core/funding_exchanges.py`
+- `config/exchanges.json`
+
+如果你要控制只启用部分交易所，直接编辑 [config/exchanges.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.json)：
+
+```json
+{
+  "enabled_exchanges": ["binance", "bybit", "gate"]
+}
+```
+
+说明：
+- 配置文件不存在时，默认启用全部交易所
+- 这里的 key 必须使用小写：如 `binance`、`grvt`、`variational`、`edgex`
+- 调度器和总 dashboard 会共用这份配置
 
 ## 4. 一键启动（推荐）
 在项目根目录执行：
@@ -122,6 +188,7 @@ python3 -m app.run_all_funding_stack --help
 - `--script-max-attempts 8`
 - `--script-retry-wait 5`
 - `--lock-file .run_all_funding_stack.lock`（单实例锁文件）
+- `--exchange-config config/exchanges.json`（控制启用哪些交易所）
 
 常见调试命令：
 
@@ -243,6 +310,7 @@ sudo systemctl daemon-reload
 - `User`（模板默认值：`root`）
 - `Group`（模板默认值：`root`）
 - `WorkingDirectory`
+- `Environment=FUNDING_EXCHANGE_CONFIG=...`（可选，默认就是 `/srv/funding/config/exchanges.json`）
 - `Environment=FUNDING_DB_PATH=...`
 - `ExecStart`
 
@@ -294,5 +362,6 @@ sudo journalctl -u funding-stack -f
 - `User`（模板默认值：`root`）
 - `Group`（模板默认值：`root`）
 - `WorkingDirectory`
+- `Environment=FUNDING_EXCHANGE_CONFIG=...`（可选）
 - `Environment=FUNDING_DB_PATH=...`
 - `ExecStart`
