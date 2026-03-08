@@ -17,6 +17,8 @@ Current folders:
 - `grvt_funding/`: GRVT collectors
 - `standx_funding/`: StandX collectors
 - `lighter_funding/`: Lighter collectors
+- `gate_funding/`: Gate collectors
+- `bitget_funding/`: Bitget collectors
 
 Manual run examples:
 

@@ -114,6 +114,26 @@ EXCHANGES: tuple[ExchangeDef, ...] = (
         history_table="lighter_funding_history",
         open_interest_is_notional=False,
     ),
+    ExchangeDef(
+        key="gate",
+        label="Gate",
+        folder=f"{EXCHANGES_DIR}/gate_funding",
+        baseinfo_script="gate_funding_baseinfo.py",
+        history_script="gate_funding_history.py",
+        info_table_candidates=("gate_funding_baseinfo",),
+        history_table="gate_funding_history",
+        open_interest_is_notional=True,
+    ),
+    ExchangeDef(
+        key="bitget",
+        label="Bitget",
+        folder=f"{EXCHANGES_DIR}/bitget_funding",
+        baseinfo_script="bitget_funding_baseinfo.py",
+        history_script="bitget_funding_history.py",
+        info_table_candidates=("bitget_funding_baseinfo",),
+        history_table="bitget_funding_history",
+        open_interest_is_notional=True,
+    ),
 )
 
 EXCHANGES_BY_KEY: dict[str, ExchangeDef] = {item.key: item for item in EXCHANGES}

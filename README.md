@@ -3,7 +3,7 @@
 ## 1. 项目简介
 本项目用于采集多个交易所永续合约资金费率数据，并写入本地 SQLite 数据库，再通过内置网页面板展示。
 
-当前覆盖交易所（9 家）：
+当前覆盖交易所（11 家）：
 - Binance
 - Bybit
 - Aster
@@ -13,6 +13,8 @@
 - GRVT
 - StandX
 - Lighter
+- Gate
+- Bitget
 
 ## 2. 运行依赖
 依赖很轻量：
@@ -63,7 +65,9 @@ Funding/
 │   ├── ethereal_funding/
 │   ├── grvt_funding/
 │   ├── standx_funding/
-│   └── lighter_funding/
+│   ├── lighter_funding/
+│   ├── gate_funding/
+│   └── bitget_funding/
 ├── logs/
 ├── funding.db
 └── systemd/
@@ -147,7 +151,7 @@ ps -Ao pid,etime,command | grep -E 'app.run_all_funding_stack|app.allfunding_das
 curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]))'
 ```
 
-检查 9 家交易所 `baseinfo` 关键字段空值：
+检查 11 家交易所 `baseinfo` 关键字段空值：
 
 ```bash
 sqlite3 funding.db "
@@ -167,7 +171,11 @@ SELECT 'grvt',     SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 
 UNION ALL
 SELECT 'standx',   SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM standx_funding_baseinfo
 UNION ALL
-SELECT 'lighter',  SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM lighter_funding_baseinfo;
+SELECT 'lighter',  SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM lighter_funding_baseinfo
+UNION ALL
+SELECT 'gate',     SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM gate_funding_baseinfo
+UNION ALL
+SELECT 'bitget',   SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM bitget_funding_baseinfo;
 "
 ```
 
