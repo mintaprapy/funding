@@ -111,7 +111,9 @@ Funding/
 │   ├── standx_funding/
 │   ├── lighter_funding/
 │   ├── gate_funding/
-│   └── bitget_funding/
+│   ├── bitget_funding/
+│   ├── variational_funding/
+│   └── edgex_funding/
 ├── config/
 │   └── exchanges.json
 ├── logs/
@@ -197,6 +199,11 @@ python3 -m app.allfunding_dashboard --host 127.0.0.1 --port 5000
 python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 ```
 
+当前运行说明：
+- 新上市或历史窗口未成熟的交易对，`24h / 3d / 7d / 15d / 30d` 会显示 `—`，不会显示误导性的 `0`
+- `edgeX` 的 `baseinfo` 首轮会比其他交易所慢一些，因为它需要逐合约拉取 ticker
+- `config/exchanges.json` 可以控制只启用部分交易所，调度器和总 dashboard 会共用这份配置
+
 ## 6. 停止服务
 停止主调度/面板：
 
@@ -218,7 +225,7 @@ ps -Ao pid,etime,command | grep -E 'app.run_all_funding_stack|app.allfunding_das
 curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]))'
 ```
 
-检查 11 家交易所 `baseinfo` 关键字段空值：
+检查 13 家交易所 `baseinfo` 关键字段空值：
 
 ```bash
 sqlite3 funding.db "
@@ -242,7 +249,11 @@ SELECT 'lighter',  SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 
 UNION ALL
 SELECT 'gate',     SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM gate_funding_baseinfo
 UNION ALL
-SELECT 'bitget',   SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM bitget_funding_baseinfo;
+SELECT 'bitget',   SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM bitget_funding_baseinfo
+UNION ALL
+SELECT 'variational', SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM variational_funding_baseinfo
+UNION ALL
+SELECT 'edgex',    SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 ELSE 0 END), SUM(CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate)='' THEN 1 ELSE 0 END), SUM(CASE WHEN openInterest IS NULL OR TRIM(openInterest)='' THEN 1 ELSE 0 END) FROM edgex_funding_baseinfo;
 "
 ```
 
