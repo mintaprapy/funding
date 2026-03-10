@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,8 @@ class ExchangeDef:
 
 
 EXCHANGES_DIR = "exchanges"
+EXCHANGE_CONFIG_ENV = "FUNDING_EXCHANGE_CONFIG"
+DEFAULT_EXCHANGE_CONFIG_RELATIVE_PATH = Path("config/exchanges.json")
 
 
 EXCHANGES: tuple[ExchangeDef, ...] = (
@@ -134,20 +138,88 @@ EXCHANGES: tuple[ExchangeDef, ...] = (
         history_table="bitget_funding_history",
         open_interest_is_notional=True,
     ),
+    ExchangeDef(
+        key="variational",
+        label="Variational",
+        folder=f"{EXCHANGES_DIR}/variational_funding",
+        baseinfo_script="variational_funding_baseinfo.py",
+        history_script="variational_funding_history.py",
+        info_table_candidates=("variational_funding_baseinfo",),
+        history_table="variational_funding_history",
+        open_interest_is_notional=True,
+    ),
+    ExchangeDef(
+        key="edgex",
+        label="edgeX",
+        folder=f"{EXCHANGES_DIR}/edgex_funding",
+        baseinfo_script="edgex_funding_baseinfo.py",
+        history_script="edgex_funding_history.py",
+        info_table_candidates=("edgex_funding_baseinfo",),
+        history_table="edgex_funding_history",
+        open_interest_is_notional=False,
+    ),
 )
 
 EXCHANGES_BY_KEY: dict[str, ExchangeDef] = {item.key: item for item in EXCHANGES}
 
 
-def baseinfo_script_paths(root: Path) -> list[Path]:
-    return [root / item.folder / item.baseinfo_script for item in EXCHANGES]
+def default_exchange_config_path(root: Path) -> Path:
+    return (root / DEFAULT_EXCHANGE_CONFIG_RELATIVE_PATH).resolve()
 
 
-def history_script_paths(root: Path) -> list[Path]:
-    return [root / item.folder / item.history_script for item in EXCHANGES]
+def resolve_exchange_config_path(root: Path, config_path: str | Path | None = None) -> Path:
+    if config_path is not None:
+        return Path(config_path).expanduser().resolve()
+    env_path = os.getenv(EXCHANGE_CONFIG_ENV)
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    return default_exchange_config_path(root)
 
 
-def dashboard_exchange_meta() -> dict[str, dict[str, Any]]:
+def _load_enabled_exchange_keys(root: Path, config_path: str | Path | None = None) -> tuple[str, ...]:
+    path = resolve_exchange_config_path(root, config_path)
+    if not path.exists():
+        return tuple(item.key for item in EXCHANGES)
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid exchange config JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"exchange config must be a JSON object: {path}")
+
+    enabled = data.get("enabled_exchanges")
+    if enabled is None:
+        return tuple(item.key for item in EXCHANGES)
+    if not isinstance(enabled, list) or not all(isinstance(item, str) for item in enabled):
+        raise RuntimeError(f"'enabled_exchanges' must be a string list: {path}")
+
+    requested = [item.strip().lower() for item in enabled if item.strip()]
+    unknown = sorted({item for item in requested if item not in EXCHANGES_BY_KEY})
+    if unknown:
+        raise RuntimeError(f"unknown exchanges in config {path}: {', '.join(unknown)}")
+
+    enabled_set = set(requested)
+    selected = tuple(item.key for item in EXCHANGES if item.key in enabled_set)
+    if not selected:
+        raise RuntimeError(f"exchange config {path} enabled 0 exchanges")
+    return selected
+
+
+def enabled_exchanges(root: Path, config_path: str | Path | None = None) -> tuple[ExchangeDef, ...]:
+    enabled_keys = set(_load_enabled_exchange_keys(root, config_path))
+    return tuple(item for item in EXCHANGES if item.key in enabled_keys)
+
+
+def baseinfo_script_paths(root: Path, config_path: str | Path | None = None) -> list[Path]:
+    return [root / item.folder / item.baseinfo_script for item in enabled_exchanges(root, config_path)]
+
+
+def history_script_paths(root: Path, config_path: str | Path | None = None) -> list[Path]:
+    return [root / item.folder / item.history_script for item in enabled_exchanges(root, config_path)]
+
+
+def dashboard_exchange_meta(root: Path, config_path: str | Path | None = None) -> dict[str, dict[str, Any]]:
     return {
         item.key: {
             "label": item.label,
@@ -155,5 +227,5 @@ def dashboard_exchange_meta() -> dict[str, dict[str, Any]]:
             "history_table": item.history_table,
             "open_interest_is_notional": item.open_interest_is_notional,
         }
-        for item in EXCHANGES
+        for item in enabled_exchanges(root, config_path)
     }

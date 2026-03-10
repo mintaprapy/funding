@@ -28,6 +28,8 @@ from core.common_funding import (
 BASE_URL = os.getenv("STANDX_BASE_URL", "https://perps.standx.com").rstrip("/")
 FUNDING_HISTORY_PATH = "/api/query_funding_rates"
 REQUEST_TIMEOUT = 15
+MAX_REQUEST_ATTEMPTS = 4
+RETRY_BASE_SLEEP = 1.0
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 INFO_TABLE = "standx_funding_baseinfo"
@@ -47,9 +49,18 @@ def sx_get(
     params: dict[str, Any] | None = None,
 ) -> Any:
     url = f"{BASE_URL}{path}"
-    resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt >= MAX_REQUEST_ATTEMPTS:
+                break
+            time.sleep(min(10.0, RETRY_BASE_SLEEP * attempt))
+    raise RuntimeError(f"请求失败: {url}; last_error={last_exc}") from last_exc
 
 
 def fetch_symbol_history(
@@ -127,11 +138,13 @@ def main() -> None:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]共 {len(symbols)} 个交易对，开始拉取近 {DAYS_TO_FETCH} 天资金费率")
 
         wrote_any = False
+        failed_symbols: list[str] = []
         for idx, symbol in enumerate(symbols, 1):
             try:
                 records = fetch_symbol_history(session, limiter, symbol, start_ms=start_ms, end_ms=end_ms)
             except Exception as exc:  # noqa: BLE001
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] {symbol} 获取失败：{exc}")
+                failed_symbols.append(symbol)
                 continue
 
             inserted = save_history(
@@ -149,6 +162,10 @@ def main() -> None:
 
         if not wrote_any:
             raise RuntimeError("StandX history 未写入任何记录")
+        if failed_symbols:
+            preview = ",".join(failed_symbols[:10])
+            suffix = "" if len(failed_symbols) <= 10 else f" ... total={len(failed_symbols)}"
+            raise RuntimeError(f"StandX history 存在未成功拉取的交易对: {preview}{suffix}")
 
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]同步完成")
 

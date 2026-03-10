@@ -18,6 +18,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from core.common_funding import (
     RateLimiter,
+    bps_to_decimal_str,
     delete_obsolete_symbols,
     ensure_baseinfo_table,
     fetch_existing_symbols,
@@ -168,8 +169,8 @@ def main() -> None:
             rows.append(
                 (
                     symbol,
-                    to_plain_str(market.get("fundingRateUpperBound")),
-                    to_plain_str(market.get("fundingRateLowerBound")),
+                    bps_to_decimal_str(market.get("fundingRateUpperBound")),
+                    bps_to_decimal_str(market.get("fundingRateLowerBound")),
                     funding_hours,
                     mark_price,
                     last_rate_s,

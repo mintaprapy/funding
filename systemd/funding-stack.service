@@ -1,4 +1,4 @@
-# Adjust User, Group, WorkingDirectory, FUNDING_DB_PATH, and ExecStart before installing.
+# Adjust User, Group, WorkingDirectory, FUNDING_EXCHANGE_CONFIG, FUNDING_DB_PATH, and ExecStart before installing.
 
 [Unit]
 Description=Funding stack scheduler and dashboard
@@ -11,6 +11,7 @@ User=root
 Group=root
 WorkingDirectory=/srv/funding
 Environment=PYTHONUNBUFFERED=1
+Environment=FUNDING_EXCHANGE_CONFIG=/srv/funding/config/exchanges.json
 Environment=FUNDING_DB_PATH=/srv/funding/funding.db
 ExecStart=/srv/funding/.venv/bin/python -m app.run_all_funding_stack --no-open-browser --host 0.0.0.0 --port 5000 --db-path /srv/funding/funding.db
 Restart=always

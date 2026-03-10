@@ -19,6 +19,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from core.common_funding import (
     RateLimiter,
+    bps_to_decimal_str,
     delete_obsolete_symbols,
     ensure_baseinfo_table,
     fetch_existing_symbols,
@@ -29,6 +30,8 @@ BASE_URL = os.getenv("GRVT_BASE_URL", "https://market-data.grvt.io").rstrip("/")
 SYMBOLS_PATH = "/full/v1/all_instruments"
 TICKER_PATH = "/full/v1/ticker"
 REQUEST_TIMEOUT = 20
+MAX_REQUEST_ATTEMPTS = 4
+RETRY_BASE_SLEEP = 1.0
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "grvt_funding_baseinfo"
@@ -44,9 +47,18 @@ def grvt_post(
     payload: dict[str, Any] | None = None,
 ) -> Any:
     url = f"{BASE_URL}{path}"
-    resp = session.post(url, json=payload or {}, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            resp = session.post(url, json=payload or {}, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt >= MAX_REQUEST_ATTEMPTS:
+                break
+            time.sleep(min(10.0, RETRY_BASE_SLEEP * attempt))
+    raise RuntimeError(f"请求失败: {url}; last_error={last_exc}") from last_exc
 
 
 def extract_data_list(payload: Any) -> list[dict[str, Any]]:
@@ -99,19 +111,23 @@ def fetch_symbols(session: requests.Session) -> dict[str, dict[str, Any]]:
     return out
 
 
-def fetch_tickers(session: requests.Session, symbols: list[str], limiter: RateLimiter) -> dict[str, dict[str, Any]]:
+def fetch_tickers(
+    session: requests.Session, symbols: list[str], limiter: RateLimiter
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
     out: dict[str, dict[str, Any]] = {}
+    failed_symbols: list[str] = []
     for symbol in symbols:
         try:
             limiter.acquire()
             payload = grvt_post(session, TICKER_PATH, {"instrument": symbol})
         except Exception as exc:  # noqa: BLE001
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] {symbol} ticker 获取失败：{exc}")
+            failed_symbols.append(symbol)
             continue
         obj = extract_data_object(payload) or {}
         if isinstance(obj, dict):
             out[symbol] = obj
-    return out
+    return out, failed_symbols
 
 
 def _extract_interval_hours(item: dict[str, Any]) -> int:
@@ -161,7 +177,7 @@ def main() -> None:
         ensure_baseinfo_table(conn, TABLE_NAME)
         symbols_meta = fetch_symbols(session)
         symbols = sorted(symbols_meta.keys())
-        tickers = fetch_tickers(session, symbols, limiter)
+        tickers, failed_symbols = fetch_tickers(session, symbols, limiter)
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（GRVT）")
 
         rows: list[tuple[Any, ...]] = []
@@ -182,11 +198,11 @@ def main() -> None:
             rows.append(
                 (
                     symbol,
-                    to_plain_str(meta.get("adjusted_funding_rate_cap") or meta.get("funding_rate_upper_limit")),
-                    to_plain_str(meta.get("adjusted_funding_rate_floor") or meta.get("funding_rate_lower_limit")),
+                    bps_to_decimal_str(meta.get("adjusted_funding_rate_cap") or meta.get("funding_rate_upper_limit")),
+                    bps_to_decimal_str(meta.get("adjusted_funding_rate_floor") or meta.get("funding_rate_lower_limit")),
                     _extract_interval_hours(meta),
                     mark_price,
-                    to_plain_str(ticker.get("funding_rate") or ticker.get("funding")),
+                    bps_to_decimal_str(ticker.get("funding_rate") or ticker.get("funding")),
                     open_interest,
                     None,
                     now_ms,
@@ -203,6 +219,10 @@ def main() -> None:
 
         save_records(conn, rows)
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条到 {TABLE_NAME}")
+        if failed_symbols:
+            preview = ",".join(failed_symbols[:10])
+            suffix = "" if len(failed_symbols) <= 10 else f" ... total={len(failed_symbols)}"
+            raise RuntimeError(f"GRVT baseinfo 存在 ticker 未成功拉取的交易对: {preview}{suffix}")
 
 
 if __name__ == "__main__":

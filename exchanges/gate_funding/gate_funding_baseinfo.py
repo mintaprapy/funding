@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,31 @@ def calc_open_interest_notional(contract: dict[str, Any], ticker: dict[str, Any]
         return None
 
 
+def funding_interval_hours(contract: dict[str, Any]) -> int:
+    interval = contract.get("funding_interval")
+    try:
+        iv = float(interval)
+    except (TypeError, ValueError):
+        return 8
+    if iv <= 0:
+        return 8
+    # Gate docs define funding_interval in seconds.
+    if iv >= 3600:
+        return max(1, int(round(iv / 3600)))
+    return max(1, int(round(iv)))
+
+
+def funding_limit_bounds(contract: dict[str, Any]) -> tuple[str | None, str | None]:
+    cap_s = to_plain_str(contract.get("funding_rate_limit") or contract.get("funding_rate_cap"))
+    floor_s = to_plain_str(contract.get("funding_rate_floor"))
+    if floor_s is None and cap_s is not None:
+        try:
+            floor_s = to_plain_str(-Decimal(cap_s))
+        except (InvalidOperation, TypeError, ValueError):
+            floor_s = None
+    return cap_s, floor_s
+
+
 def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
     conn.executemany(
         f"""
@@ -171,14 +197,8 @@ def main() -> None:
         for symbol in symbols:
             contract = contracts[symbol]
             ticker = tickers.get(symbol)
-
-            funding_hours = 8
-            interval = contract.get("funding_interval")
-            if isinstance(interval, (int, float)):
-                funding_hours = max(1, int(interval))
-
-            cap_s = to_plain_str(contract.get("funding_cap_ratio") or contract.get("funding_rate_cap"))
-            floor_s = to_plain_str(contract.get("funding_floor_ratio") or contract.get("funding_rate_floor"))
+            funding_hours = funding_interval_hours(contract)
+            cap_s, floor_s = funding_limit_bounds(contract)
 
             mark = None
             last_rate = None

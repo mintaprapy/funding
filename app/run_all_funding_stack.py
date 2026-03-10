@@ -23,14 +23,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.common_funding import tune_sqlite_connection
-from core.funding_exchanges import baseinfo_script_paths, history_script_paths
+from core.funding_exchanges import (
+    EXCHANGE_CONFIG_ENV,
+    baseinfo_script_paths,
+    default_exchange_config_path,
+    enabled_exchanges,
+    history_script_paths,
+)
 
 FUNDING_DB_PATH_ENV = "FUNDING_DB_PATH"
 DEFAULT_DB_PATH = ROOT / "funding.db"
-
-BASEINFO_SCRIPTS = baseinfo_script_paths(ROOT)
-HISTORY_SCRIPTS = history_script_paths(ROOT)
-
 
 @dataclass
 class Job:
@@ -258,6 +260,11 @@ def parse_args() -> argparse.Namespace:
         help="Shared SQLite path used by the scheduler, collectors, and dashboard",
     )
     parser.add_argument(
+        "--exchange-config",
+        default=str(default_exchange_config_path(ROOT)),
+        help="JSON config path controlling enabled exchanges (defaults to config/exchanges.json)",
+    )
+    parser.add_argument(
         "--script-max-attempts",
         type=int,
         default=8,
@@ -276,6 +283,14 @@ def main() -> None:
     args = parse_args()
     baseinfo_minutes = parse_minutes(args.baseinfo_minutes)
     history_minutes = parse_minutes(args.history_minutes)
+    exchange_config_path = Path(args.exchange_config).expanduser().resolve()
+    try:
+        selected_exchanges = enabled_exchanges(ROOT, exchange_config_path)
+    except RuntimeError as exc:
+        log(f"[{now_str()}] [error] {exc}")
+        raise SystemExit(1)
+    baseinfo_scripts = baseinfo_script_paths(ROOT, exchange_config_path)
+    history_scripts = history_script_paths(ROOT, exchange_config_path)
 
     stop_requested = False
 
@@ -293,8 +308,8 @@ def main() -> None:
     lock_fp: TextIO | None = None
 
     jobs = [
-        Job(name="baseinfo", minutes=baseinfo_minutes, scripts=BASEINFO_SCRIPTS),
-        Job(name="history", minutes=history_minutes, scripts=HISTORY_SCRIPTS),
+        Job(name="baseinfo", minutes=baseinfo_minutes, scripts=baseinfo_scripts),
+        Job(name="history", minutes=history_minutes, scripts=history_scripts),
     ]
 
     try:
@@ -306,7 +321,13 @@ def main() -> None:
         db_path = Path(args.db_path).expanduser().resolve()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         os.environ[FUNDING_DB_PATH_ENV] = str(db_path)
+        os.environ[EXCHANGE_CONFIG_ENV] = str(exchange_config_path)
         log(f"[{now_str()}] runtime database: {db_path}")
+        log(
+            f"[{now_str()}] enabled exchanges ({len(selected_exchanges)}): "
+            + ", ".join(item.label for item in selected_exchanges)
+        )
+        log(f"[{now_str()}] exchange config: {exchange_config_path}")
         prepare_sqlite_runtime(db_path)
 
         if not args.skip_dashboard:
@@ -324,7 +345,7 @@ def main() -> None:
             run_batch(
                 "baseinfo(startup)",
                 args.python,
-                BASEINFO_SCRIPTS,
+                baseinfo_scripts,
                 should_stop=lambda: stop_requested,
                 max_attempts=args.script_max_attempts,
                 retry_wait_s=args.script_retry_wait,
@@ -335,7 +356,7 @@ def main() -> None:
             run_batch(
                 "history(startup)",
                 args.python,
-                HISTORY_SCRIPTS,
+                history_scripts,
                 should_stop=lambda: stop_requested,
                 max_attempts=args.script_max_attempts,
                 retry_wait_s=args.script_retry_wait,

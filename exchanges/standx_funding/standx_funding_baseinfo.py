@@ -28,6 +28,8 @@ BASE_URL = os.getenv("STANDX_BASE_URL", "https://perps.standx.com").rstrip("/")
 SYMBOL_INFO_PATH = "/api/query_symbol_info"
 SYMBOL_MARKET_PATH = "/api/query_symbol_market"
 REQUEST_TIMEOUT = 15
+MAX_REQUEST_ATTEMPTS = 4
+RETRY_BASE_SLEEP = 1.0
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "standx_funding_baseinfo"
@@ -44,9 +46,18 @@ def sx_get(
     params: dict[str, Any] | None = None,
 ) -> Any:
     url = f"{BASE_URL}{path}"
-    resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt >= MAX_REQUEST_ATTEMPTS:
+                break
+            time.sleep(min(10.0, RETRY_BASE_SLEEP * attempt))
+    raise RuntimeError(f"请求失败: {url}; last_error={last_exc}") from last_exc
 
 
 def fetch_symbols(session: requests.Session) -> dict[str, dict[str, Any]]:

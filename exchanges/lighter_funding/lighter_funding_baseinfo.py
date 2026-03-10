@@ -29,6 +29,9 @@ ORDER_BOOK_DETAILS_PATH = "/api/v1/orderBookDetails"
 EXCHANGE_STATS_PATH = "/api/v1/exchangeStats"
 FUNDING_RATES_PATH = "/api/v1/funding-rates"
 REQUEST_TIMEOUT = 15
+MAX_REQUEST_ATTEMPTS = 4
+RETRY_BASE_SLEEP = 1.0
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "lighter_funding_baseinfo"
@@ -42,19 +45,39 @@ def lighter_get(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     url = f"{BASE_URL}{path}"
-    resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{path} 返回格式异常（非 dict）")
-    return data
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"{path} 返回格式异常（非 dict）")
+            return data
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status not in RETRYABLE_STATUS_CODES or attempt >= MAX_REQUEST_ATTEMPTS:
+                raise
+            sleep_for = min(20.0, RETRY_BASE_SLEEP * attempt)
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] {path} HTTP {status}，"
+                f"第 {attempt}/{MAX_REQUEST_ATTEMPTS} 次失败，{sleep_for:.1f}s 后重试"
+            )
+            time.sleep(sleep_for)
+        except (requests.RequestException, RuntimeError) as exc:
+            if attempt >= MAX_REQUEST_ATTEMPTS:
+                raise
+            sleep_for = min(20.0, RETRY_BASE_SLEEP * attempt)
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] {path} 请求失败：{exc}，"
+                f"第 {attempt}/{MAX_REQUEST_ATTEMPTS} 次失败，{sleep_for:.1f}s 后重试"
+            )
+            time.sleep(sleep_for)
+    raise RuntimeError(f"{path} 请求失败")
 
 
-def fetch_order_books(session: requests.Session) -> dict[str, dict[str, Any]]:
-    data = lighter_get(session, ORDER_BOOKS_PATH)
-    items = data.get("order_books")
+def _extract_active_perp_markets(items: Any, *, source_name: str) -> dict[str, dict[str, Any]]:
     if not isinstance(items, list):
-        raise RuntimeError("orderBooks 返回格式异常（缺少 order_books）")
+        raise RuntimeError(f"{source_name} 返回格式异常（缺少列表）")
     out: dict[str, dict[str, Any]] = {}
     for item in items:
         if not isinstance(item, dict):
@@ -68,8 +91,18 @@ def fetch_order_books(session: requests.Session) -> dict[str, dict[str, Any]]:
             continue
         out[symbol] = item
     if not out:
-        raise RuntimeError("未获取到 Lighter perp 交易对")
+        raise RuntimeError(f"未获取到 Lighter perp 交易对（来源：{source_name}）")
     return out
+
+
+def fetch_order_books(session: requests.Session) -> dict[str, dict[str, Any]]:
+    try:
+        data = lighter_get(session, ORDER_BOOKS_PATH)
+        return _extract_active_perp_markets(data.get("order_books"), source_name="orderBooks")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] 获取 orderBooks 失败，回退到 orderBookDetails：{exc}")
+        data = lighter_get(session, ORDER_BOOK_DETAILS_PATH, params={"filter": "perp"})
+        return _extract_active_perp_markets(data.get("order_book_details"), source_name="orderBookDetails")
 
 
 def fetch_stats_by_symbol(session: requests.Session) -> dict[str, dict[str, Any]]:

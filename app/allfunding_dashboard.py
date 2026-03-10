@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.common_funding import tune_sqlite_connection
+from core.common_funding import to_plain_str, tune_sqlite_connection
 from core.funding_exchanges import dashboard_exchange_meta
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT / "funding.db")).expanduser().resolve()
@@ -35,7 +35,7 @@ WINDOWS = [
     ("d30", 30 * 24 * 60 * 60 * 1000, "30 天"),
 ]
 
-EXCHANGES: dict[str, dict[str, Any]] = dashboard_exchange_meta()
+EXCHANGES: dict[str, dict[str, Any]] = dashboard_exchange_meta(ROOT)
 
 MAX_WINDOW_MS = max(span for _, span, _ in WINDOWS)
 PAYLOAD_CACHE_TTL_SEC = 10.0
@@ -47,6 +47,8 @@ _INFO_TABLE_BY_EXCHANGE: dict[str, str] = {}
 _PAYLOAD_CACHE_LOCK = threading.Lock()
 _PAYLOAD_CACHE: dict[str, Any] | None = None
 _PAYLOAD_CACHE_TS = 0.0
+
+APP_META_TABLE = "app_meta"
 
 
 def _to_number(val: Any) -> float | None:
@@ -63,6 +65,252 @@ def connect_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     tune_sqlite_connection(conn)
     return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _ensure_app_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {APP_META_TABLE} (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at INTEGER
+        )
+        """
+    )
+
+
+def _migration_applied(conn: sqlite3.Connection, key: str) -> bool:
+    _ensure_app_meta_table(conn)
+    row = conn.execute(f"SELECT 1 FROM {APP_META_TABLE} WHERE key=? LIMIT 1", (key,)).fetchone()
+    return row is not None
+
+
+def _mark_migration_applied(conn: sqlite3.Connection, key: str) -> None:
+    _ensure_app_meta_table(conn)
+    conn.execute(
+        f"""
+        INSERT INTO {APP_META_TABLE} (key, value, updated_at)
+        VALUES (?, '1', ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value=excluded.value,
+            updated_at=excluded.updated_at
+        """,
+        (key, int(time.time() * 1000)),
+    )
+    conn.commit()
+
+
+def _normalize_legacy_bps_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    *,
+    threshold: float,
+) -> None:
+    if not _table_exists(conn, table):
+        return
+    max_abs = 0.0
+    for column in columns:
+        row = conn.execute(
+            f"SELECT MAX(ABS(CAST({column} AS REAL))) FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchone()
+        current = row[0]
+        if current is None:
+            continue
+        max_abs = max(max_abs, abs(float(current)))
+    if max_abs <= threshold:
+        return
+
+    cur = conn.execute(f"SELECT rowid, {', '.join(columns)} FROM {table}")
+    updates: list[tuple[Any, ...]] = []
+    for row in cur.fetchall():
+        converted = []
+        for column in columns:
+            value = _to_number(row[column])
+            converted.append(None if value is None else to_plain_str(value / 10000.0))
+        updates.append((*converted, row["rowid"]))
+
+    assignments = ", ".join(f"{column}=?" for column in columns)
+    conn.executemany(f"UPDATE {table} SET {assignments} WHERE rowid=?", updates)
+    conn.commit()
+
+
+def _normalize_legacy_lighter_history_percent(conn: sqlite3.Connection) -> None:
+    migration_key = "lighter_funding_history_rate_pct_to_decimal_v1"
+    table = "lighter_funding_history"
+    if _migration_applied(conn, migration_key) or not _table_exists(conn, table):
+        return
+
+    evidence = conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE fundingRate IS NOT NULL AND ABS(CAST(fundingRate AS REAL)) > 0.005"
+    ).fetchone()
+    if not evidence or int(evidence[0] or 0) <= 0:
+        return
+
+    rows = conn.execute(f"SELECT rowid, fundingRate FROM {table} WHERE fundingRate IS NOT NULL").fetchall()
+    updates: list[tuple[Any, ...]] = []
+    for row in rows:
+        value = _to_number(row["fundingRate"])
+        if value is None:
+            continue
+        updates.append((to_plain_str(value / 100.0), row["rowid"]))
+    if updates:
+        conn.executemany(f"UPDATE {table} SET fundingRate=? WHERE rowid=?", updates)
+        conn.commit()
+    _mark_migration_applied(conn, migration_key)
+
+
+def _normalize_legacy_percent_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    *,
+    threshold: float,
+    migration_key: str,
+) -> None:
+    if _migration_applied(conn, migration_key) or not _table_exists(conn, table):
+        return
+
+    max_abs = 0.0
+    for column in columns:
+        row = conn.execute(
+            f"SELECT MAX(ABS(CAST({column} AS REAL))) FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchone()
+        current = row[0]
+        if current is None:
+            continue
+        max_abs = max(max_abs, abs(float(current)))
+    if max_abs <= threshold:
+        return
+
+    cur = conn.execute(f"SELECT rowid, {', '.join(columns)} FROM {table}")
+    updates: list[tuple[Any, ...]] = []
+    for row in cur.fetchall():
+        converted = []
+        for column in columns:
+            value = _to_number(row[column])
+            converted.append(None if value is None else to_plain_str(value / 100.0))
+        updates.append((*converted, row["rowid"]))
+
+    assignments = ", ".join(f"{column}=?" for column in columns)
+    conn.executemany(f"UPDATE {table} SET {assignments} WHERE rowid=?", updates)
+    conn.commit()
+    _mark_migration_applied(conn, migration_key)
+
+
+def _variational_legacy_interval_factor(interval_hours: Any) -> float | None:
+    hours = _to_number(interval_hours)
+    if hours is None or hours <= 0:
+        return None
+    return ((24.0 / hours) * 365.0) / 100.0
+
+
+def _normalize_legacy_variational_annualized_baseinfo(conn: sqlite3.Connection) -> None:
+    migration_key = "variational_funding_baseinfo_annualized_to_interval_v1"
+    table = "variational_funding_baseinfo"
+    if _migration_applied(conn, migration_key) or not _table_exists(conn, table):
+        return
+
+    evidence = conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE lastFundingRate IS NOT NULL AND ABS(CAST(lastFundingRate AS REAL)) > 0.05"
+    ).fetchone()
+    if not evidence or int(evidence[0] or 0) <= 0:
+        return
+
+    rows = conn.execute(
+        f"SELECT rowid, lastFundingRate, fundingIntervalHours FROM {table} WHERE lastFundingRate IS NOT NULL"
+    ).fetchall()
+    updates: list[tuple[Any, ...]] = []
+    for row in rows:
+        value = _to_number(row["lastFundingRate"])
+        factor = _variational_legacy_interval_factor(row["fundingIntervalHours"])
+        if value is None or factor is None:
+            continue
+        updates.append((to_plain_str(value / factor), row["rowid"]))
+    if updates:
+        conn.executemany(f"UPDATE {table} SET lastFundingRate=? WHERE rowid=?", updates)
+        conn.commit()
+    _mark_migration_applied(conn, migration_key)
+
+
+def _normalize_legacy_variational_annualized_history(conn: sqlite3.Connection) -> None:
+    migration_key = "variational_funding_history_annualized_to_interval_v1"
+    table = "variational_funding_history"
+    info_table = "variational_funding_baseinfo"
+    if _migration_applied(conn, migration_key) or not _table_exists(conn, table):
+        return
+
+    evidence = conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE fundingRate IS NOT NULL AND ABS(CAST(fundingRate AS REAL)) > 0.05"
+    ).fetchone()
+    if not evidence or int(evidence[0] or 0) <= 0:
+        return
+
+    interval_by_symbol: dict[str, Any] = {}
+    if _table_exists(conn, info_table):
+        interval_by_symbol = {
+            str(row["symbol"]): row["fundingIntervalHours"]
+            for row in conn.execute(f"SELECT symbol, fundingIntervalHours FROM {info_table}")
+        }
+
+    rows = conn.execute(f"SELECT rowid, symbol, fundingRate FROM {table} WHERE fundingRate IS NOT NULL").fetchall()
+    updates: list[tuple[Any, ...]] = []
+    for row in rows:
+        value = _to_number(row["fundingRate"])
+        factor = _variational_legacy_interval_factor(interval_by_symbol.get(str(row["symbol"]), 8))
+        if value is None or factor is None:
+            continue
+        updates.append((to_plain_str(value / factor), row["rowid"]))
+    if updates:
+        conn.executemany(f"UPDATE {table} SET fundingRate=? WHERE rowid=?", updates)
+        conn.commit()
+    _mark_migration_applied(conn, migration_key)
+
+
+def normalize_legacy_units(conn: sqlite3.Connection) -> None:
+    _normalize_legacy_bps_columns(
+        conn,
+        "grvt_funding_baseinfo",
+        ["adjustedFundingRateCap", "adjustedFundingRateFloor", "lastFundingRate"],
+        threshold=0.005,
+    )
+    _normalize_legacy_bps_columns(
+        conn,
+        "grvt_funding_history",
+        ["fundingRate"],
+        threshold=0.005,
+    )
+    _normalize_legacy_bps_columns(
+        conn,
+        "backpack_funding_baseinfo",
+        ["adjustedFundingRateCap", "adjustedFundingRateFloor"],
+        threshold=1.0,
+    )
+    _normalize_legacy_percent_columns(
+        conn,
+        "variational_funding_baseinfo",
+        ["lastFundingRate"],
+        threshold=1.0,
+        migration_key="variational_funding_baseinfo_rate_pct_to_decimal_v1",
+    )
+    _normalize_legacy_percent_columns(
+        conn,
+        "variational_funding_history",
+        ["fundingRate"],
+        threshold=1.0,
+        migration_key="variational_funding_history_rate_pct_to_decimal_v1",
+    )
+    _normalize_legacy_variational_annualized_baseinfo(conn)
+    _normalize_legacy_variational_annualized_history(conn)
+    _normalize_legacy_lighter_history_percent(conn)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
@@ -132,6 +380,7 @@ def prepare_schema(conn: sqlite3.Connection) -> None:
             history_table = str(meta["history_table"])
             ensure_history_table(conn, history_table)
             mapping[exchange] = info_table
+        normalize_legacy_units(conn)
         _INFO_TABLE_BY_EXCHANGE = mapping
         _SCHEMA_PREPARED = True
 
@@ -166,22 +415,32 @@ def fetch_base_info(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]
 
 def fetch_cumulative_rates(
     conn: sqlite3.Connection, *, history_table: str, now_ms: int
-) -> dict[str, dict[str, float]]:
-    params = [now_ms - span for _, span, _ in WINDOWS]
+) -> dict[str, dict[str, float | None]]:
+    params: list[int] = []
     case_parts = [
-        f"COALESCE(SUM(CASE WHEN fundingTime >= ? THEN CAST(fundingRate AS REAL) ELSE 0 END), 0) AS {key}"
-        for key, _, _ in WINDOWS
+        f"COALESCE(SUM(CASE WHEN fundingTime >= ? AND fundingTime <= ? THEN CAST(fundingRate AS REAL) ELSE 0 END), 0) AS {key}"
+        for key, span, _ in WINDOWS
     ]
+    for _, span, _ in WINDOWS:
+        params.extend([now_ms - span, now_ms])
     sql = f"""
-        SELECT symbol, {", ".join(case_parts)}
+        SELECT symbol,
+               MIN(fundingTime) AS oldestFundingTime,
+               {", ".join(case_parts)}
         FROM {history_table}
-        WHERE fundingTime >= ?
+        WHERE fundingTime <= ?
         GROUP BY symbol
     """
-    cur = conn.execute(sql, [*params, now_ms - MAX_WINDOW_MS])
-    result: dict[str, dict[str, float]] = {}
+    cur = conn.execute(sql, [*params, now_ms])
+    result: dict[str, dict[str, float | None]] = {}
     for row in cur.fetchall():
-        result[row["symbol"]] = {key: float(row[key]) for key, _, _ in WINDOWS}
+        oldest = row["oldestFundingTime"]
+        oldest_ms = int(oldest) if oldest is not None else None
+        sums: dict[str, float | None] = {}
+        for key, span, _ in WINDOWS:
+            mature = oldest_ms is not None and oldest_ms <= now_ms - span
+            sums[key] = float(row[key]) if mature else None
+        result[row["symbol"]] = sums
     return result
 
 
@@ -198,7 +457,7 @@ def _build_payload_uncached() -> dict[str, Any]:
             history_table = str(meta["history_table"])
             base_rows = fetch_base_info(conn, info_table)
             sums_by_symbol = fetch_cumulative_rates(conn, history_table=history_table, now_ms=now_ms)
-            default_sums = {key: 0.0 for key, _, _ in WINDOWS}
+            default_sums = {key: None for key, _, _ in WINDOWS}
 
             for row in base_rows:
                 sums = sums_by_symbol.get(row["symbol"], default_sums)
@@ -361,6 +620,73 @@ def _render_html(*, static_payload_json: str) -> str:
     .pill input::placeholder {{
       color: var(--muted);
     }}
+    .exchange-pill {{
+      flex-direction: column;
+      align-items: stretch;
+      gap: 10px;
+      min-width: 420px;
+    }}
+    .exchange-tools {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .exchange-action {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      font-size: 12px;
+      cursor: pointer;
+    }}
+    .exchange-group {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .exchange-choice {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      user-select: none;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }}
+    .exchange-choice.active {{
+      background: rgba(34,211,238,0.12);
+      border-color: rgba(34,211,238,0.45);
+    }}
+    .exchange-main {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+    }}
+    .exchange-choice input {{
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      flex: none;
+      accent-color: var(--accent);
+    }}
+    .exchange-choice .choice-text {{
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1;
+    }}
+    .exchange-choice .choice-count {{
+      color: var(--muted);
+      font-size: 12px;
+      font-family: 'Menlo', 'SFMono-Regular', Consolas, monospace;
+      line-height: 1;
+    }}
     .badge {{
       display: inline-flex;
       align-items: center;
@@ -493,6 +819,7 @@ def _render_html(*, static_payload_json: str) -> str:
       header {{ flex-direction: column; align-items: flex-start; }}
       .controls {{ flex-direction: column; }}
       .pill {{ width: 100%; }}
+      .exchange-pill {{ min-width: 0; }}
       .shell {{ padding: 20px 16px 40px; }}
     }}
   </style>
@@ -502,42 +829,29 @@ def _render_html(*, static_payload_json: str) -> str:
     <header>
       <div class="hero">
         <h1>Funding Dashboard</h1>
-        <div class="sub"> Binance / Bybit / Aster / Hyperliquid / Backpack / Ethereal / GRVT / StandX / Lighter 永续合约资金费率 </div>
+        <div class="sub"> Binance / Bybit / Aster / Hyperliquid / Backpack / Ethereal / GRVT / StandX / Lighter / Gate / Bitget / Variational / edgeX 永续合约资金费率 </div>
       </div>
       <div class="chip" id="summaryChip">加载中…</div>
     </header>
 
     <div class="controls">
-      <div class="pill">
-        <label for="exchangeSelect">交易所</label>
-        <select id="exchangeSelect">
-          <option value="all">全部</option>
-        </select>
+      <div class="pill exchange-pill">
+        <label>交易所</label>
+        <div class="exchange-tools">
+          <button type="button" class="exchange-action" id="exchangeSelectAll">全选</button>
+          <button type="button" class="exchange-action" id="exchangeInvert">反选</button>
+        </div>
+        <div class="exchange-group" id="exchangeChoices"></div>
       </div>
       <div class="pill">
         <label for="searchBox">搜索交易对</label>
-        <input id="searchBox" type="text" placeholder="如 BTC" />
+        <input id="searchBox" type="text" placeholder="如 BTC，精确搜索用 BTC/" />
       </div>
-      <div class="pill">
-        <label for="sortKey">排序</label>
-        <select id="sortKey">
-          <option value="symbol">按交易对</option>
-          <option value="exchange">按交易所</option>
-          <option value="lastFundingRate">最新资金费率</option>
-          <option value="openInterestNotional">持仓量(M$)</option>
-          <option value="insuranceBalance">风险金(M)</option>
-          <option value="h24">24 小时累计</option>
-          <option value="d3">3 天累计</option>
-          <option value="d7">7 天累计</option>
-          <option value="d15">15 天累计</option>
-          <option value="d30">30 天累计</option>
-        </select>
-      </div>
-      <div class="badge" id="lastUpdated">更新中…</div>
       <div class="pill range-pill">
         <div class="range-title">持仓量 &gt; <span id="oiFilterLabel">0</span>M</div>
         <input id="oiFilter" type="range" min="0" max="7" step="1" value="0" />
       </div>
+      <div class="badge" id="lastUpdated">更新中…</div>
     </div>
 
     <div class="table-wrap">
@@ -579,6 +893,7 @@ def _render_html(*, static_payload_json: str) -> str:
     const WINDOW_KEYS = WINDOWS_META.map(w => w.key);
     const WINDOW_DAYS_BY_KEY = Object.fromEntries(WINDOWS_META.map(w => [w.key, w.spanMs / 86400000]));
     const STR_COLLATOR = new Intl.Collator(undefined, {{ numeric: true, sensitivity: 'base' }});
+    const RENDER_CHUNK_SIZE = 180;
     const toPct = (v) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(4) + '%';
     const toPctFixed = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(digits) + '%';
     const toNum = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : Number(v).toLocaleString(undefined, {{ maximumFractionDigits: digits }});
@@ -587,7 +902,9 @@ def _render_html(*, static_payload_json: str) -> str:
       if (v == null || Number.isNaN(v)) return '—';
       const absV = Math.abs(Number(v));
       if (absV > 0 && absV < 0.0001) return Number(v).toFixed(8);
-      return toNum(v, 4);
+      if (absV > 1) return toNumFixed(v, 2);
+      if (absV >= 0.01) return toNum(v, 4);
+      return toNum(v, 6);
     }};
     const classFor = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim';
 
@@ -597,8 +914,11 @@ def _render_html(*, static_payload_json: str) -> str:
     let sortKey = 'symbol';
     let sortDir = 'asc';
     let oiThresholdIdx = 0;
-    let exchangeFilter = 'all';
+    let selectedExchanges = new Set(EXCHANGES_META.map(x => x.key));
+    let exchangeCounts = {{}};
     let fixedColumnsApplied = false;
+    let renderVersion = 0;
+    let scheduledRender = null;
 
     function exchangeLabel(key) {{
       const hit = EXCHANGES_META.find(x => x.key === key);
@@ -606,8 +926,25 @@ def _render_html(*, static_payload_json: str) -> str:
     }}
 
     function displaySymbol(sym) {{
-      const s = String(sym || '');
-      return s.endsWith('USDT') ? s.slice(0, -4) : s;
+      const s = String(sym || '').trim();
+      const pairs = [
+        '_USDT_PERP',
+        '_USDC_PERP',
+        '_USD_PERP',
+        '_USDT',
+        '_USDC',
+        '_USD',
+        '_PERP',
+        'USDT',
+        'USDC',
+      ];
+      const upper = s.toUpperCase();
+      for (const suffix of pairs) {{
+        if (upper.endsWith(suffix)) {{
+          return s.slice(0, s.length - suffix.length);
+        }}
+      }}
+      return s;
     }}
 
     function prepareItems(items) {{
@@ -624,14 +961,54 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
     }}
 
-    function fillExchangeOptions() {{
-      const sel = document.getElementById('exchangeSelect');
-      EXCHANGES_META.forEach(x => {{
-        const opt = document.createElement('option');
-        opt.value = x.key;
-        opt.textContent = x.label;
-        sel.appendChild(opt);
+    function allExchangesSelected() {{
+      return selectedExchanges.size === EXCHANGES_META.length;
+    }}
+
+    function renderExchangeChoices() {{
+      const group = document.getElementById('exchangeChoices');
+      if (!group) return;
+      const totalCount = dataCache.length;
+      const items = [
+        {{ key: 'all', label: '全部', count: totalCount, checked: allExchangesSelected() }},
+        ...EXCHANGES_META.map(x => ({{
+          key: x.key,
+          label: x.label,
+          count: exchangeCounts[x.key] || 0,
+          checked: selectedExchanges.has(x.key),
+        }})),
+      ];
+      group.innerHTML = items.map(item => `
+        <div class="exchange-choice ${'{'}item.checked ? 'active' : ''{'}'}" data-key="${'{'}item.key{'}'}">
+          <label class="exchange-main">
+            <input type="checkbox" ${'{'}item.checked ? 'checked' : ''{'}'} />
+            <span class="choice-text">${'{'}item.label{'}'}</span>
+            <span class="choice-count">${'{'}item.count{'}'}</span>
+          </label>
+        </div>
+      `).join('');
+      group.querySelectorAll('.exchange-main input').forEach(input => {{
+        input.addEventListener('change', handleExchangeChoiceChange);
       }});
+    }}
+
+    function handleExchangeChoiceChange(event) {{
+      const input = event.currentTarget;
+      const wrapper = input.closest('.exchange-choice');
+      const key = wrapper ? wrapper.dataset.key : null;
+      const checked = !!input.checked;
+      if (!key) return;
+      if (key === 'all') {{
+        selectedExchanges = checked ? new Set(EXCHANGES_META.map(x => x.key)) : new Set();
+      }} else {{
+        if (checked) {{
+          selectedExchanges.add(key);
+        }} else {{
+          selectedExchanges.delete(key);
+        }}
+      }}
+      renderExchangeChoices();
+      render();
     }}
 
     function applyFixedColumnWidths() {{
@@ -690,25 +1067,27 @@ def _render_html(*, static_payload_json: str) -> str:
       const total = dataCache.length;
       const counts = {{}};
       dataCache.forEach(it => counts[it.exchange] = (counts[it.exchange] || 0) + 1);
+      exchangeCounts = counts;
       const parts = EXCHANGES_META.map(x => `${'{'}x.label{'}'} ${{counts[x.key] || 0}}`).join(' · ');
       chip.textContent = `共 ${{total}} 个交易对（${'{'}parts{'}'}）`;
       document.getElementById('lastUpdated').textContent = `生成时间：${'{'}updated.toLocaleString(){'}'}`;
       footer.textContent = '历史数据 1 小时更新一次，其他数据 10 分钟更新一次';
+      renderExchangeChoices();
     }}
 
     function getSortValue(item, key) {{
       if (!key || key === 'symbol') return item._sortSym || '';
       if (key === 'exchange') return item._sortExchange || '';
       if (['lastFundingRate', 'openInterestNotional', 'insuranceBalance', 'markPrice', 'fundingIntervalHours', 'adjustedFundingRateCap', 'adjustedFundingRateFloor'].includes(key)) {{
-        return Number(item[key] ?? 0);
+        return item[key] == null ? null : Number(item[key]);
       }}
       if (key === 'bounds') {{
-        return Number(item.adjustedFundingRateCap ?? 0);
+        return item.adjustedFundingRateCap == null ? null : Number(item.adjustedFundingRateCap);
       }}
       if (item.sums && key in item.sums) {{
-        return Number(item.sums[key] ?? 0);
+        return item.sums[key] == null ? null : Number(item.sums[key]);
       }}
-      return 0;
+      return null;
     }}
 
     function updateSortIndicators() {{
@@ -719,18 +1098,69 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
     }}
 
-    function render() {{
+    function renderRow(item) {{
+      const sums = item.sums || {{}};
+      const windowCells = WINDOW_KEYS.map(key => {{
+        const v = sums[key];
+        const days = WINDOW_DAYS_BY_KEY[key] || null;
+        const ann = days && v != null ? (v / days) * 365 : null;
+        return `<td class="num"><div class="stack"><span class="${'{'}classFor(v){'}'}">${'{'}toPct(v){'}'}</span><span class="mini ${'{'}classFor(ann){'}'}">APR ${'{'}toPctFixed(ann, 2){'}'}</span></div></td>`;
+      }}).join('');
+      const notionalDisplay = item.openInterestNotional == null ? null : item.openInterestNotional / 1_000_000;
+      const insuranceDisplay = item.insuranceBalance == null ? null : item.insuranceBalance / 1_000_000;
+      const latestAnn = item.fundingIntervalHours ? (item.lastFundingRate ?? 0) * (24 / item.fundingIntervalHours) * 365 : null;
+      return `
+        <tr>
+          <td><span class="tag">${'{'}exchangeLabel(item.exchange){'}'}</span></td>
+          <td><span class="tag">${'{'}item._displaySym || displaySymbol(item.symbol){'}'}</span></td>
+          <td class="num">${'{'}formatMarkPrice(item.markPrice){'}'}</td>
+          <td class="num">${'{'}toNumFixed(notionalDisplay, 2){'}'}</td>
+          <td class="num">${'{'}toNumFixed(insuranceDisplay, 2){'}'}</td>
+          <td class="num"><div class="stack"><span class="${'{'}classFor(item.lastFundingRate){'}'}">${'{'}toPct(item.lastFundingRate){'}'}</span><span class="mini ${'{'}classFor(latestAnn){'}'}">APR ${'{'}toPctFixed(latestAnn, 2){'}'}</span></div></td>
+          <td class="num">${'{'}item.fundingIntervalHours ? item.fundingIntervalHours + 'h' : '—'{'}'}</td>
+          <td class="num"><div class="stack"><span class="mini">${'{'}toPctFixed(item.adjustedFundingRateCap, 2){'}'}</span><span class="mini">${'{'}toPctFixed(item.adjustedFundingRateFloor, 2){'}'}</span></div></td>
+          ${'{'}windowCells{'}'}
+        </tr>
+      `;
+    }}
+
+    function appendRowsInChunks(body, rows, version, offset = 0) {{
+      if (version !== renderVersion) return;
+      const chunk = rows.slice(offset, offset + RENDER_CHUNK_SIZE);
+      if (!chunk.length) {{
+        if (!fixedColumnsApplied) applyFixedColumnWidths();
+        return;
+      }}
+      body.insertAdjacentHTML('beforeend', chunk.map(renderRow).join(''));
+      const nextOffset = offset + chunk.length;
+      if (nextOffset >= rows.length) {{
+        if (!fixedColumnsApplied) applyFixedColumnWidths();
+        return;
+      }}
+      requestAnimationFrame(() => appendRowsInChunks(body, rows, version, nextOffset));
+    }}
+
+    function renderNow() {{
       const body = document.getElementById('table-body');
-      const q = document.getElementById('searchBox').value.trim().toUpperCase();
+      renderVersion += 1;
+      const version = renderVersion;
+      const rawQuery = document.getElementById('searchBox').value.trim().toUpperCase();
+      const exactSearch = rawQuery.endsWith('/');
+      const q = exactSearch ? rawQuery.slice(0, -1).trim() : rawQuery;
       const threshold = OI_THRESHOLDS[oiThresholdIdx] * 1_000_000;
       const filtered = dataCache.filter(item => {{
-        const hitExchange = exchangeFilter === 'all' || item.exchange === exchangeFilter;
+        const hitExchange = selectedExchanges.size > 0 && selectedExchanges.has(item.exchange);
         const rawSym = item._rawSym || '';
         const dispSym = item._sortSym || '';
-        const hitSymbol = !q || rawSym.includes(q) || dispSym.includes(q);
+        const hitSymbol = !q || (
+          exactSearch
+            ? rawSym === q || dispSym === q
+            : rawSym.includes(q) || dispSym.includes(q)
+        );
         const notional = item.openInterestNotional ?? 0;
-        const hitOi = notional >= threshold;
-        return hitExchange && hitSymbol && hitOi;
+        const hideDefaultZeroOiGrvt = item.exchange === 'grvt' && !q && notional <= 0;
+        const hitOi = exactSearch && q ? true : notional >= threshold;
+        return hitExchange && hitSymbol && hitOi && !hideDefaultZeroOiGrvt;
       }});
 
       const sorted = filtered.sort((a, b) => {{
@@ -743,7 +1173,20 @@ def _render_html(*, static_payload_json: str) -> str:
           const sb = b._rawSym || '';
           return STR_COLLATOR.compare(sa, sb);
         }}
-        return sortDir === 'asc' ? va - vb : vb - va;
+        const aMissing = va == null || Number.isNaN(va);
+        const bMissing = vb == null || Number.isNaN(vb);
+        if (aMissing && bMissing) {{
+          const base = STR_COLLATOR.compare(a._sortSym || '', b._sortSym || '');
+          if (base !== 0) return base;
+          return STR_COLLATOR.compare(a._rawSym || '', b._rawSym || '');
+        }}
+        if (aMissing) return 1;
+        if (bMissing) return -1;
+        const diff = sortDir === 'asc' ? va - vb : vb - va;
+        if (diff !== 0) return diff;
+        const base = STR_COLLATOR.compare(a._sortSym || '', b._sortSym || '');
+        if (base !== 0) return base;
+        return STR_COLLATOR.compare(a._rawSym || '', b._rawSym || '');
       }});
 
       if (!sorted.length) {{
@@ -752,51 +1195,33 @@ def _render_html(*, static_payload_json: str) -> str:
         return;
       }}
 
-      body.innerHTML = sorted.map(item => {{
-        const sums = item.sums || {{}};
-        const windowCells = WINDOW_KEYS.map(key => {{
-          const v = sums[key];
-          const days = WINDOW_DAYS_BY_KEY[key] || null;
-          const ann = days ? (v ?? 0) / days * 365 : null;
-          return `<td class="num"><div class="stack"><span class="${'{'}classFor(v){'}'}">${'{'}toPct(v){'}'}</span><span class="mini ${'{'}classFor(ann){'}'}">APR ${'{'}toPctFixed(ann, 2){'}'}</span></div></td>`;
-        }}).join('');
-        const notionalDisplay = item.openInterestNotional == null ? null : item.openInterestNotional / 1_000_000;
-        const insuranceDisplay = item.insuranceBalance == null ? null : item.insuranceBalance / 1_000_000;
-        const latestAnn = item.fundingIntervalHours ? (item.lastFundingRate ?? 0) * (24 / item.fundingIntervalHours) * 365 : null;
-        return `
-          <tr>
-            <td><span class="tag">${'{'}exchangeLabel(item.exchange){'}'}</span></td>
-            <td><span class="tag">${'{'}item._displaySym || displaySymbol(item.symbol){'}'}</span></td>
-            <td class="num">${'{'}formatMarkPrice(item.markPrice){'}'}</td>
-            <td class="num">${'{'}toNumFixed(notionalDisplay, 2){'}'}</td>
-            <td class="num">${'{'}toNumFixed(insuranceDisplay, 2){'}'}</td>
-            <td class="num"><div class="stack"><span class="${'{'}classFor(item.lastFundingRate){'}'}">${'{'}toPct(item.lastFundingRate){'}'}</span><span class="mini ${'{'}classFor(latestAnn){'}'}">APR ${'{'}toPctFixed(latestAnn, 2){'}'}</span></div></td>
-            <td class="num">${'{'}item.fundingIntervalHours ? item.fundingIntervalHours + 'h' : '—'{'}'}</td>
-            <td class="num"><div class="stack"><span class="mini">${'{'}toPctFixed(item.adjustedFundingRateCap, 2){'}'}</span><span class="mini">${'{'}toPctFixed(item.adjustedFundingRateFloor, 2){'}'}</span></div></td>
-            ${'{'}windowCells{'}'}
-          </tr>
-        `;
-      }}).join('');
       updateSortIndicators();
-      applyFixedColumnWidths();
+      body.innerHTML = '';
+      appendRowsInChunks(body, sorted, version);
     }}
 
-    fillExchangeOptions();
+    function render() {{
+      if (scheduledRender) cancelAnimationFrame(scheduledRender);
+      scheduledRender = requestAnimationFrame(() => {{
+        scheduledRender = null;
+        renderNow();
+      }});
+    }}
 
     let searchDebounce = null;
     document.getElementById('searchBox').addEventListener('input', () => {{
       if (searchDebounce) clearTimeout(searchDebounce);
       searchDebounce = setTimeout(render, 80);
     }});
-    document.getElementById('exchangeSelect').addEventListener('change', (e) => {{
-      exchangeFilter = e.target.value;
+    document.getElementById('exchangeSelectAll').addEventListener('click', () => {{
+      selectedExchanges = new Set(EXCHANGES_META.map(x => x.key));
+      renderExchangeChoices();
       render();
     }});
-
-    const dropdown = document.getElementById('sortKey');
-    dropdown.addEventListener('change', (e) => {{
-      sortKey = e.target.value;
-      sortDir = (sortKey === 'symbol' || sortKey === 'exchange') ? 'asc' : 'desc';
+    document.getElementById('exchangeInvert').addEventListener('click', () => {{
+      const inverted = EXCHANGES_META.filter(x => !selectedExchanges.has(x.key)).map(x => x.key);
+      selectedExchanges = new Set(inverted);
+      renderExchangeChoices();
       render();
     }});
 
@@ -822,7 +1247,6 @@ def _render_html(*, static_payload_json: str) -> str:
         }} else {{
           sortKey = key;
           sortDir = (key === 'symbol' || key === 'exchange') ? 'asc' : 'desc';
-          dropdown.value = key;
         }}
         render();
       }});

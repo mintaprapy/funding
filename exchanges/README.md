@@ -19,6 +19,8 @@ Current folders:
 - `lighter_funding/`: Lighter collectors
 - `gate_funding/`: Gate collectors
 - `bitget_funding/`: Bitget collectors
+- `variational_funding/`: Variational collectors
+- `edgex_funding/`: edgeX collectors
 
 Manual run examples:
 

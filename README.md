@@ -79,18 +79,18 @@ pip install -U pip requests
 - 公共模块目录：`core/`
 - 交易所采集脚本目录：`exchanges/`
 - 启用交易所配置：`config/exchanges.json`
+- 本地辅助脚本目录：`scripts/`
 - systemd 模板目录：`systemd/`
 - 运行数据库：`funding.db`
 - 运行日志目录：`logs/`
 
-当前仓库根目录只保留 shell 入口、部署文件和文档；Python 代码已按职责拆到 `app/`、`core/`、`exchanges/`，GitHub 首页会明显更干净。
+当前仓库根目录只保留 shell 入口、部署文件和文档；Python 代码已按职责拆到 `app/`、`core/`、`exchanges/`。部署说明统一以本 README 为准，避免多份文档重复维护。
 
 简化后的结构如下：
 
 ```text
 Funding/
 ├── README.md
-├── DEPLOY_DAY_CHECKLIST.md
 ├── start_all_funding.sh
 ├── app/
 │   ├── __init__.py
@@ -116,6 +116,8 @@ Funding/
 │   └── edgex_funding/
 ├── config/
 │   └── exchanges.json
+├── scripts/
+│   └── cleanup_logs.py
 ├── logs/
 ├── funding.db
 └── systemd/
@@ -126,6 +128,7 @@ Funding/
 - `core/`：公共 SQLite、限速、交易所注册表等共享代码
 - `exchanges/`：各交易所的 `baseinfo`、`history`、单交易所 dashboard
 - `config/exchanges.json`：控制启动时启用哪些交易所
+- `scripts/`：本地辅助脚本，例如清理长时间测试生成的日志控制文件
 - `systemd/`：线上部署用服务模板
 - `start_all_funding.sh`：面向人工执行的统一入口
 
@@ -145,6 +148,7 @@ Funding/
 
 说明：
 - 配置文件不存在时，默认启用全部交易所
+- 仓库当前自带这份文件，默认启用全部 13 家交易所
 - 这里的 key 必须使用小写：如 `binance`、`grvt`、`variational`、`edgex`
 - 调度器和总 dashboard 会共用这份配置
 
@@ -202,7 +206,10 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 当前运行说明：
 - 新上市或历史窗口未成熟的交易对，`24h / 3d / 7d / 15d / 30d` 会显示 `—`，不会显示误导性的 `0`
 - `edgeX` 的 `baseinfo` 首轮会比其他交易所慢一些，因为它需要逐合约拉取 ticker
+- `Variational` 的 `funding_rate` 来自年化值，代码会自动换算成单结算周期资金费率后再展示
 - `config/exchanges.json` 可以控制只启用部分交易所，调度器和总 dashboard 会共用这份配置
+- 搜索框末尾加 `/` 表示精确搜索，例如 `BTC/`
+- 交易所筛选支持多选，`24h / 3d / 7d / 15d / 30d` 的 `—` 在排序时统一排在最后
 
 ## 6. 停止服务
 停止主调度/面板：
@@ -308,6 +315,7 @@ python -m app.run_all_funding_stack --once --no-open-browser --host 0.0.0.0 --po
 说明：
 - 这一步建议保留，不要跳过
 - 首次空库全量回填耗时较长，属于正常现象
+- 如果你已经手动跑过这一轮，并且不想让 `systemd` 首次启动时再重复跑一次启动批次，可以在 `ExecStart` 末尾追加 `--no-run-on-start`
 
 ### 9.4 用 systemd 启动（推荐）
 先安装服务文件：
@@ -376,3 +384,22 @@ sudo journalctl -u funding-stack -f
 - `Environment=FUNDING_EXCHANGE_CONFIG=...`（可选）
 - `Environment=FUNDING_DB_PATH=...`
 - `ExecStart`
+
+## 11. 本地长跑日志清理
+如果你在本地做过 `10h / 12h` 这类长时间测试，`logs/` 目录里会保留报告、日志和快照。
+
+为了避免历史控制脚本影响整仓检查，可以在测试结束后执行：
+
+```bash
+python3 scripts/cleanup_logs.py
+```
+
+清理规则：
+- 没有 `report.md` 的失败尝试目录：直接删除
+- 有 `report.md` 的运行目录：保留报告、日志、快照，删除 `monitor_local_run.py`、`controller.sh`、`*.pid`、`*.plist` 等控制文件
+
+清理后再次做整仓编译检查：
+
+```bash
+python3 -m compileall -q .
+```

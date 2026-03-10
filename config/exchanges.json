@@ -1,0 +1,17 @@
+{
+  "enabled_exchanges": [
+    "binance",
+    "bybit",
+    "aster",
+    "hyperliquid",
+    "backpack",
+    "ethereal",
+    "grvt",
+    "standx",
+    "lighter",
+    "gate",
+    "bitget",
+    "variational",
+    "edgex"
+  ]
+}

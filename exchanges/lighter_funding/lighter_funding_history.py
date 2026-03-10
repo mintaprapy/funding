@@ -22,6 +22,7 @@ from core.common_funding import (
     delete_older_than,
     ensure_history_table,
     load_symbols,
+    pct_to_decimal_str,
     to_plain_str,
 )
 
@@ -78,7 +79,7 @@ def fetch_market_ids(session: requests.Session) -> dict[str, int]:
 
 
 def _to_signed_rate(rate: Any, direction: Any) -> str | None:
-    rate_s = to_plain_str(rate)
+    rate_s = pct_to_decimal_str(rate)
     if rate_s is None:
         return None
     direction_s = str(direction or "").strip().lower()
@@ -88,7 +89,7 @@ def _to_signed_rate(rate: Any, direction: Any) -> str | None:
         dec = Decimal(rate_s)
     except (InvalidOperation, TypeError, ValueError):
         return rate_s
-    # Lighter 返回 direction + 正值 rate：约定 direction=short 记为负值。
+    # /api/v1/fundings 的 rate 字段是百分比值，先换成小数，再按 direction 赋符号。
     if direction_s == "short":
         dec = -dec
     return to_plain_str(dec)

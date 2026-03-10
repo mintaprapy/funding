@@ -33,6 +33,36 @@ def to_plain_str(val: Any) -> str | None:
     return format(dec.normalize(), "f")
 
 
+def bps_to_decimal_str(val: Any) -> str | None:
+    plain = to_plain_str(val)
+    if plain is None:
+        return None
+    return to_plain_str(Decimal(plain) / Decimal("10000"))
+
+
+def pct_to_decimal_str(val: Any) -> str | None:
+    plain = to_plain_str(val)
+    if plain is None:
+        return None
+    return to_plain_str(Decimal(plain) / Decimal("100"))
+
+
+def annualized_decimal_to_interval_decimal_str(val: Any, interval_seconds: Any) -> str | None:
+    plain = to_plain_str(val)
+    if plain is None:
+        return None
+    try:
+        interval_s = Decimal(str(interval_seconds))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if interval_s <= 0:
+        return None
+    periods_per_year = (Decimal("365") * Decimal("24") * Decimal("3600")) / interval_s
+    if periods_per_year <= 0:
+        return None
+    return to_plain_str(Decimal(plain) / periods_per_year)
+
+
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
     cur = conn.execute(f"PRAGMA table_info({table})")
     existing = {row[1] for row in cur.fetchall()}
