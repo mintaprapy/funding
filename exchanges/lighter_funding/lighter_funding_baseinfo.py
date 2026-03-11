@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "lighter_funding_baseinfo"
 DEFAULT_FUNDING_INTERVAL_HOURS = 1
+FUNDING_RATES_EQUIVALENT_HOURS = Decimal("8")
 
 
 def lighter_get(
@@ -73,6 +75,24 @@ def lighter_get(
             )
             time.sleep(sleep_for)
     raise RuntimeError(f"{path} 请求失败")
+
+
+def _normalize_rest_funding_rate(rate: Any) -> str | None:
+    plain = to_plain_str(rate)
+    if plain is None:
+        return None
+    try:
+        value = Decimal(plain)
+        interval_hours = Decimal(str(DEFAULT_FUNDING_INTERVAL_HOURS))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if interval_hours <= 0:
+        return None
+    # /api/v1/funding-rates 返回的是 8h 等效资金费率，这里换回实际 1h 结算口径。
+    factor = FUNDING_RATES_EQUIVALENT_HOURS / interval_hours
+    if factor <= 0:
+        return None
+    return to_plain_str(value / factor)
 
 
 def _extract_active_perp_markets(items: Any, *, source_name: str) -> dict[str, dict[str, Any]]:
@@ -132,7 +152,7 @@ def fetch_funding_rate_by_symbol(session: requests.Session) -> dict[str, str]:
         symbol = item.get("symbol")
         if not isinstance(symbol, str) or not symbol:
             continue
-        rate_s = to_plain_str(item.get("rate"))
+        rate_s = _normalize_rest_funding_rate(item.get("rate"))
         if rate_s is not None:
             out[symbol] = rate_s
     return out

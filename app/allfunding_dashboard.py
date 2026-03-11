@@ -168,6 +168,64 @@ def _normalize_legacy_lighter_history_percent(conn: sqlite3.Connection) -> None:
     _mark_migration_applied(conn, migration_key)
 
 
+def _normalize_legacy_lighter_baseinfo_8h_equivalent(conn: sqlite3.Connection) -> None:
+    migration_key = "lighter_funding_baseinfo_8h_equivalent_to_hourly_v1"
+    table = "lighter_funding_baseinfo"
+    history_table = "lighter_funding_history"
+    if _migration_applied(conn, migration_key) or not _table_exists(conn, table) or not _table_exists(conn, history_table):
+        return
+
+    rows = conn.execute(
+        f"""
+        WITH latest_history AS (
+            SELECT h.symbol, h.fundingRate
+            FROM {history_table} h
+            JOIN (
+                SELECT symbol, MAX(fundingTime) AS max_time
+                FROM {history_table}
+                GROUP BY symbol
+            ) latest
+              ON latest.symbol = h.symbol
+             AND latest.max_time = h.fundingTime
+        )
+        SELECT
+            b.rowid,
+            b.lastFundingRate,
+            latest_history.fundingRate AS latestFundingRate
+        FROM {table} b
+        LEFT JOIN latest_history ON latest_history.symbol = b.symbol
+        WHERE b.lastFundingRate IS NOT NULL
+        """
+    ).fetchall()
+    if not rows:
+        return
+
+    ratios: list[float] = []
+    updates: list[tuple[Any, ...]] = []
+    for row in rows:
+        base_value = _to_number(row["lastFundingRate"])
+        if base_value is None:
+            continue
+        latest_history_value = _to_number(row["latestFundingRate"])
+        if latest_history_value is not None and abs(latest_history_value) > 1e-9 and abs(base_value) > 1e-9:
+            ratios.append(abs(base_value) / abs(latest_history_value))
+        updates.append((to_plain_str(base_value / 8.0), row["rowid"]))
+
+    if len(ratios) < 10:
+        return
+
+    ratios.sort()
+    median_ratio = ratios[len(ratios) // 2]
+    legacy_like = sum(1 for value in ratios if 6.0 <= value <= 10.0)
+    normalized_like = sum(1 for value in ratios if 0.5 <= value <= 1.5)
+    if median_ratio < 4.0 or legacy_like <= normalized_like:
+        return
+
+    conn.executemany(f"UPDATE {table} SET lastFundingRate=? WHERE rowid=?", updates)
+    conn.commit()
+    _mark_migration_applied(conn, migration_key)
+
+
 def _normalize_legacy_percent_columns(
     conn: sqlite3.Connection,
     table: str,
@@ -311,6 +369,7 @@ def normalize_legacy_units(conn: sqlite3.Connection) -> None:
     _normalize_legacy_variational_annualized_baseinfo(conn)
     _normalize_legacy_variational_annualized_history(conn)
     _normalize_legacy_lighter_history_percent(conn)
+    _normalize_legacy_lighter_baseinfo_8h_equivalent(conn)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
