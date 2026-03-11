@@ -4,14 +4,24 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import sys
 import time
+import ssl
+import asyncio
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import requests
+
+try:
+    import certifi
+    import websockets
+except Exception:  # noqa: BLE001
+    certifi = None
+    websockets = None
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
 if str(ROOT_DIR) not in sys.path:
@@ -29,6 +39,7 @@ ORDER_BOOKS_PATH = "/api/v1/orderBooks"
 ORDER_BOOK_DETAILS_PATH = "/api/v1/orderBookDetails"
 EXCHANGE_STATS_PATH = "/api/v1/exchangeStats"
 FUNDING_RATES_PATH = "/api/v1/funding-rates"
+STREAM_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 REQUEST_TIMEOUT = 15
 MAX_REQUEST_ATTEMPTS = 4
 RETRY_BASE_SLEEP = 1.0
@@ -140,6 +151,42 @@ def fetch_stats_by_symbol(session: requests.Session) -> dict[str, dict[str, Any]
     return out
 
 
+async def _fetch_market_stats_via_websocket() -> dict[str, dict[str, Any]]:
+    if websockets is None or certifi is None:
+        raise RuntimeError("websockets/certifi 不可用")
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    async with websockets.connect(
+        STREAM_URL,
+        ssl=ssl_ctx,
+        open_timeout=REQUEST_TIMEOUT,
+        close_timeout=5,
+        ping_interval=None,
+    ) as ws:
+        await ws.send(json.dumps({"type": "subscribe", "channel": "market_stats/all"}))
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        while time.monotonic() < deadline:
+            timeout = max(1.0, deadline - time.monotonic())
+            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            payload = json.loads(raw)
+            items = payload.get("market_stats")
+            if not isinstance(items, dict):
+                continue
+            out: dict[str, dict[str, Any]] = {}
+            for item in items.values():
+                if not isinstance(item, dict):
+                    continue
+                symbol = item.get("symbol")
+                if isinstance(symbol, str) and symbol:
+                    out[symbol] = item
+            if out:
+                return out
+    raise RuntimeError("market_stats websocket 未返回可用数据")
+
+
+def fetch_market_stats_by_symbol() -> dict[str, dict[str, Any]]:
+    return asyncio.run(_fetch_market_stats_via_websocket())
+
+
 def fetch_funding_rate_by_symbol(session: requests.Session) -> dict[str, str]:
     data = lighter_get(session, FUNDING_RATES_PATH)
     items = data.get("funding_rates")
@@ -206,6 +253,11 @@ def main() -> None:
 
         order_books = fetch_order_books(session)
         stats_by_symbol = fetch_stats_by_symbol(session)
+        try:
+            market_stats_by_symbol = fetch_market_stats_by_symbol()
+        except Exception as exc:  # noqa: BLE001
+            market_stats_by_symbol = {}
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] 获取 market_stats 失败，回退到 last_trade_price：{exc}")
         rates_by_symbol = fetch_funding_rate_by_symbol(session)
         try:
             oi_by_symbol = fetch_open_interest_by_symbol(session)
@@ -218,13 +270,14 @@ def main() -> None:
         rows: list[tuple[Any, ...]] = []
         for symbol in symbols:
             stats = stats_by_symbol.get(symbol, {})
+            market_stats = market_stats_by_symbol.get(symbol, {})
             rows.append(
                 (
                     symbol,
                     None,
                     None,
                     DEFAULT_FUNDING_INTERVAL_HOURS,
-                    to_plain_str(stats.get("last_trade_price")),
+                    to_plain_str(market_stats.get("mark_price") or market_stats.get("markPrice") or stats.get("last_trade_price")),
                     rates_by_symbol.get(symbol),
                     oi_by_symbol.get(symbol),
                     None,
