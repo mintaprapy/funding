@@ -109,16 +109,21 @@ def calc_open_interest_notional(contract: dict[str, Any], ticker: dict[str, Any]
     if direct is not None:
         return direct
 
-    oi = to_plain_str(ticker.get("holdingAmount") or ticker.get("openInterest") or ticker.get("size"))
+    base_coin_oi = to_plain_str(ticker.get("holdingAmount") or ticker.get("openInterest"))
     mark = to_plain_str(ticker.get("markPrice") or ticker.get("lastPr") or ticker.get("indexPrice"))
-    if oi is None or mark is None:
+    if base_coin_oi is not None and mark is not None:
+        try:
+            return to_plain_str(Decimal(base_coin_oi) * Decimal(mark))
+        except Exception:  # noqa: BLE001
+            return None
+
+    size = to_plain_str(ticker.get("size"))
+    if size is None or mark is None:
         return None
 
-    multiplier = to_plain_str(
-        contract.get("sizeMultiplier") or contract.get("contractSize") or contract.get("minTradeNum") or 1
-    )
+    multiplier = to_plain_str(contract.get("sizeMultiplier") or contract.get("contractSize") or 1)
     try:
-        return to_plain_str(Decimal(oi) * Decimal(mark) * Decimal(multiplier or "1"))
+        return to_plain_str(Decimal(size) * Decimal(mark) * Decimal(multiplier or "1"))
     except Exception:  # noqa: BLE001
         return None
 
