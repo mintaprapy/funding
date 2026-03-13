@@ -33,6 +33,9 @@ from core.funding_exchanges import (
 
 FUNDING_DB_PATH_ENV = "FUNDING_DB_PATH"
 DEFAULT_DB_PATH = ROOT / "funding.db"
+BASEINFO_FRAGILE_EXCHANGES = frozenset({"grvt", "standx"})
+HISTORY_FRAGILE_EXCHANGES = frozenset({"grvt", "edgex"})
+HISTORY_DEDICATED_LANES = {"binance": "binance"}
 
 @dataclass
 class Job:
@@ -40,6 +43,28 @@ class Job:
     minutes: list[int]
     scripts: list[Path]
     next_run: datetime | None = None
+
+
+@dataclass(frozen=True)
+class BatchTask:
+    script: Path
+    exchange_key: str
+    lane: str
+    order: int
+
+
+@dataclass
+class PendingTask:
+    task: BatchTask
+    attempt: int
+    ready_at: float = 0.0
+
+
+@dataclass
+class RunningTask:
+    pending: PendingTask
+    proc: subprocess.Popen[str]
+    started_at: float
 
 
 def log(message: str) -> None:
@@ -104,6 +129,76 @@ def start_dashboard(python_bin: str, host: str, preferred_port: int) -> tuple[su
     return proc, port
 
 
+def normalize_worker_count(value: int) -> int:
+    return max(1, int(value))
+
+
+def batch_lane_limits(
+    batch_name: str,
+    *,
+    baseinfo_general_workers: int,
+    history_general_workers: int,
+    fragile_workers: int,
+) -> dict[str, int]:
+    if batch_name.startswith("history"):
+        return {
+            "binance": 1,
+            "fragile": normalize_worker_count(fragile_workers),
+            "general": normalize_worker_count(history_general_workers),
+        }
+    return {
+        "fragile": normalize_worker_count(fragile_workers),
+        "general": normalize_worker_count(baseinfo_general_workers),
+    }
+
+
+def task_lane(batch_name: str, exchange_key: str) -> str:
+    if batch_name.startswith("history"):
+        dedicated = HISTORY_DEDICATED_LANES.get(exchange_key)
+        if dedicated is not None:
+            return dedicated
+        if exchange_key in HISTORY_FRAGILE_EXCHANGES:
+            return "fragile"
+        return "general"
+    if exchange_key in BASEINFO_FRAGILE_EXCHANGES:
+        return "fragile"
+    return "general"
+
+
+def build_batch_tasks(
+    batch_name: str,
+    scripts: list[Path],
+    script_exchange_keys: dict[Path, str] | None,
+) -> list[BatchTask]:
+    tasks: list[BatchTask] = []
+    for index, script in enumerate(scripts):
+        exchange_key = (
+            script_exchange_keys.get(script.resolve(), script.parent.name)
+            if script_exchange_keys is not None
+            else script.parent.name
+        )
+        tasks.append(
+            BatchTask(
+                script=script,
+                exchange_key=exchange_key,
+                lane=task_lane(batch_name, exchange_key),
+                order=index,
+            )
+        )
+    return tasks
+
+
+def stop_subprocess(proc: subprocess.Popen[str], *, grace_seconds: float = 3.0) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=grace_seconds)
+
+
 def run_script(
     python_bin: str,
     script: Path,
@@ -155,22 +250,124 @@ def run_batch(
     max_attempts: int = 1,
     retry_wait_s: float = 3.0,
     script_timeout_s: float = 1800.0,
+    script_exchange_keys: dict[Path, str] | None = None,
+    baseinfo_general_workers: int = 2,
+    history_general_workers: int = 2,
+    fragile_workers: int = 1,
 ) -> None:
     log(f"[{now_str()}] ===== {name} batch start ({len(scripts)} scripts) =====")
+    if not scripts:
+        log(f"[{now_str()}] ===== {name} batch end: 0/0 success, 0.0s =====")
+        return
     ok = 0
     started = time.monotonic()
-    for script in scripts:
-        if should_stop is not None and should_stop():
+    timeout_val = script_timeout_s if script_timeout_s > 0 else None
+    lane_limits = batch_lane_limits(
+        name,
+        baseinfo_general_workers=baseinfo_general_workers,
+        history_general_workers=history_general_workers,
+        fragile_workers=fragile_workers,
+    )
+    pending: list[PendingTask] = [
+        PendingTask(task=task, attempt=1)
+        for task in build_batch_tasks(name, scripts, script_exchange_keys)
+    ]
+    running: list[RunningTask] = []
+    stop_logged = False
+    max_attempts = max(1, max_attempts)
+
+    while pending or running:
+        stop_requested = should_stop is not None and should_stop()
+        if stop_requested and not stop_logged:
             log(f"[{now_str()}] [warn] stop requested, interrupting {name} batch")
+            stop_logged = True
+            for job in running:
+                stop_subprocess(job.proc)
+
+        now_mono = time.monotonic()
+        made_progress = False
+
+        for job in running[:]:
+            code = job.proc.poll()
+            timed_out = False
+            if code is None and timeout_val is not None and now_mono - job.started_at >= timeout_val:
+                stop_subprocess(job.proc)
+                code = 124
+                timed_out = True
+            if code is None:
+                continue
+
+            running.remove(job)
+            made_progress = True
+            cost = time.monotonic() - job.started_at
+            timeout_note = f" (timeout {timeout_val:g}s)" if timed_out and timeout_val else ""
+            if code == 0:
+                ok += 1
+                log(f"[{now_str()}] done {job.pending.task.script.name} in {cost:.1f}s")
+                continue
+
+            if not stop_requested and job.pending.attempt < max_attempts:
+                wait_s = max(0.5, retry_wait_s * job.pending.attempt)
+                log(
+                    f"[{now_str()}] [warn] {job.pending.task.script.name} exited with code {code} after {cost:.1f}s"
+                    f"{timeout_note}; retry in {wait_s:.1f}s"
+                )
+                pending.append(
+                    PendingTask(
+                        task=job.pending.task,
+                        attempt=job.pending.attempt + 1,
+                        ready_at=time.monotonic() + wait_s,
+                    )
+                )
+                continue
+
+            log(f"[{now_str()}] [warn] {job.pending.task.script.name} exited with code {code} after {cost:.1f}s{timeout_note}")
+
+        if stop_requested:
+            if running:
+                time.sleep(0.2)
+                continue
             break
-        if run_script(
-            python_bin,
-            script,
-            max_attempts=max_attempts,
-            retry_wait_s=retry_wait_s,
-            timeout_s=script_timeout_s,
-        ):
-            ok += 1
+
+        pending.sort(key=lambda item: (item.ready_at, item.task.order))
+        lane_counts: dict[str, int] = {}
+        active_exchanges = set()
+        for job in running:
+            lane_counts[job.pending.task.lane] = lane_counts.get(job.pending.task.lane, 0) + 1
+            active_exchanges.add(job.pending.task.exchange_key)
+
+        for item in pending[:]:
+            if item.ready_at > now_mono:
+                continue
+            lane_limit = lane_limits.get(item.task.lane, 1)
+            if lane_counts.get(item.task.lane, 0) >= lane_limit:
+                continue
+            if item.task.exchange_key in active_exchanges:
+                continue
+            if not item.task.script.exists():
+                log(f"[{now_str()}] [error] missing script: {item.task.script}")
+                pending.remove(item)
+                made_progress = True
+                continue
+
+            cmd = [python_bin, str(item.task.script)]
+            suffix = f" (attempt {item.attempt}/{max_attempts}, lane={item.task.lane})" if max_attempts > 1 else f" (lane={item.task.lane})"
+            log(f"[{now_str()}] run {item.task.script.relative_to(ROOT)}{suffix}")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=ROOT,
+                text=True,
+                stdin=subprocess.DEVNULL,
+            )
+            running.append(RunningTask(pending=item, proc=proc, started_at=time.monotonic()))
+            lane_counts[item.task.lane] = lane_counts.get(item.task.lane, 0) + 1
+            active_exchanges.add(item.task.exchange_key)
+            pending.remove(item)
+            made_progress = True
+
+        if not made_progress:
+            time.sleep(0.2)
+
     cost = time.monotonic() - started
     log(f"[{now_str()}] ===== {name} batch end: {ok}/{len(scripts)} success, {cost:.1f}s =====")
 
@@ -276,6 +473,24 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Base retry backoff seconds between failed attempts",
     )
+    parser.add_argument(
+        "--baseinfo-general-workers",
+        type=int,
+        default=2,
+        help="Concurrent workers for non-fragile baseinfo scripts",
+    )
+    parser.add_argument(
+        "--history-general-workers",
+        type=int,
+        default=2,
+        help="Concurrent workers for non-fragile history scripts",
+    )
+    parser.add_argument(
+        "--fragile-workers",
+        type=int,
+        default=1,
+        help="Concurrent workers for fragile exchange lanes",
+    )
     return parser.parse_args()
 
 
@@ -291,6 +506,10 @@ def main() -> None:
         raise SystemExit(1)
     baseinfo_scripts = baseinfo_script_paths(ROOT, exchange_config_path)
     history_scripts = history_script_paths(ROOT, exchange_config_path)
+    script_exchange_keys: dict[Path, str] = {}
+    for item in selected_exchanges:
+        script_exchange_keys[(ROOT / item.folder / item.baseinfo_script).resolve()] = item.key
+        script_exchange_keys[(ROOT / item.folder / item.history_script).resolve()] = item.key
 
     stop_requested = False
 
@@ -350,6 +569,10 @@ def main() -> None:
                 max_attempts=args.script_max_attempts,
                 retry_wait_s=args.script_retry_wait,
                 script_timeout_s=args.script_timeout_seconds,
+                script_exchange_keys=script_exchange_keys,
+                baseinfo_general_workers=args.baseinfo_general_workers,
+                history_general_workers=args.history_general_workers,
+                fragile_workers=args.fragile_workers,
             )
             if stop_requested:
                 return
@@ -361,6 +584,10 @@ def main() -> None:
                 max_attempts=args.script_max_attempts,
                 retry_wait_s=args.script_retry_wait,
                 script_timeout_s=args.script_timeout_seconds,
+                script_exchange_keys=script_exchange_keys,
+                baseinfo_general_workers=args.baseinfo_general_workers,
+                history_general_workers=args.history_general_workers,
+                fragile_workers=args.fragile_workers,
             )
             if stop_requested:
                 return
@@ -397,6 +624,10 @@ def main() -> None:
                         max_attempts=args.script_max_attempts,
                         retry_wait_s=args.script_retry_wait,
                         script_timeout_s=args.script_timeout_seconds,
+                        script_exchange_keys=script_exchange_keys,
+                        baseinfo_general_workers=args.baseinfo_general_workers,
+                        history_general_workers=args.history_general_workers,
+                        fragile_workers=args.fragile_workers,
                     )
                     if stop_requested:
                         break

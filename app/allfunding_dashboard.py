@@ -226,6 +226,99 @@ def _normalize_legacy_lighter_baseinfo_8h_equivalent(conn: sqlite3.Connection) -
     _mark_migration_applied(conn, migration_key)
 
 
+def _normalize_legacy_grvt_overdivided_baseinfo(conn: sqlite3.Connection) -> None:
+    migration_key = "grvt_funding_baseinfo_decimal_scale_fix_v1"
+    table = "grvt_funding_baseinfo"
+    columns = ["adjustedFundingRateCap", "adjustedFundingRateFloor", "lastFundingRate"]
+    if _migration_applied(conn, migration_key) or not _table_exists(conn, table):
+        return
+
+    row = conn.execute(
+        f"""
+        SELECT MAX(ABS(CAST(adjustedFundingRateCap AS REAL))) AS max_cap
+        FROM {table}
+        WHERE adjustedFundingRateCap IS NOT NULL
+        """
+    ).fetchone()
+    max_cap = _to_number(row["max_cap"] if row else None)
+    if max_cap is None or max_cap <= 0.0 or max_cap > 0.001:
+        return
+
+    rows = conn.execute(f"SELECT rowid, {', '.join(columns)} FROM {table}").fetchall()
+    updates: list[tuple[Any, ...]] = []
+    for row in rows:
+        converted = []
+        for column in columns:
+            value = _to_number(row[column])
+            converted.append(None if value is None else to_plain_str(value * 100.0))
+        updates.append((*converted, row["rowid"]))
+
+    assignments = ", ".join(f"{column}=?" for column in columns)
+    conn.executemany(f"UPDATE {table} SET {assignments} WHERE rowid=?", updates)
+    conn.commit()
+    _mark_migration_applied(conn, migration_key)
+
+
+def _normalize_legacy_grvt_overdivided_history(conn: sqlite3.Connection) -> None:
+    migration_key = "grvt_funding_history_decimal_scale_fix_v1"
+    table = "grvt_funding_history"
+    info_table = "grvt_funding_baseinfo"
+    if _migration_applied(conn, migration_key) or not _table_exists(conn, table) or not _table_exists(conn, info_table):
+        return
+
+    rows = conn.execute(
+        f"""
+        WITH latest_history AS (
+            SELECT h.rowid, h.symbol, h.fundingRate
+            FROM {table} h
+            JOIN (
+                SELECT symbol, MAX(fundingTime) AS max_time
+                FROM {table}
+                GROUP BY symbol
+            ) latest
+              ON latest.symbol = h.symbol
+             AND latest.max_time = h.fundingTime
+        )
+        SELECT latest_history.rowid, latest_history.symbol, latest_history.fundingRate, b.lastFundingRate
+        FROM latest_history
+        JOIN {info_table} b ON b.symbol = latest_history.symbol
+        WHERE latest_history.fundingRate IS NOT NULL AND b.lastFundingRate IS NOT NULL
+        """
+    ).fetchall()
+    if len(rows) < 10:
+        return
+
+    ratios: list[float] = []
+    for row in rows:
+        history_value = _to_number(row["fundingRate"])
+        base_value = _to_number(row["lastFundingRate"])
+        if history_value is None or base_value is None:
+            continue
+        if abs(history_value) <= 1e-12 or abs(base_value) <= 1e-12:
+            continue
+        ratios.append(abs(history_value) / abs(base_value))
+    if len(ratios) < 10:
+        return
+
+    ratios.sort()
+    median_ratio = ratios[len(ratios) // 2]
+    overdivided_like = sum(1 for value in ratios if 0.005 <= value <= 0.02)
+    normalized_like = sum(1 for value in ratios if 0.5 <= value <= 1.5)
+    if median_ratio >= 0.2 or overdivided_like <= normalized_like:
+        return
+
+    updates: list[tuple[Any, ...]] = []
+    for row in conn.execute(f"SELECT rowid, fundingRate FROM {table} WHERE fundingRate IS NOT NULL").fetchall():
+        value = _to_number(row["fundingRate"])
+        if value is None:
+            continue
+        updates.append((to_plain_str(value * 100.0), row["rowid"]))
+    if updates:
+        conn.executemany(f"UPDATE {table} SET fundingRate=? WHERE rowid=?", updates)
+        conn.commit()
+    _mark_migration_applied(conn, migration_key)
+
+
 def _normalize_legacy_percent_columns(
     conn: sqlite3.Connection,
     table: str,
@@ -334,17 +427,21 @@ def _normalize_legacy_variational_annualized_history(conn: sqlite3.Connection) -
 
 
 def normalize_legacy_units(conn: sqlite3.Connection) -> None:
-    _normalize_legacy_bps_columns(
+    _normalize_legacy_grvt_overdivided_baseinfo(conn)
+    _normalize_legacy_percent_columns(
         conn,
         "grvt_funding_baseinfo",
         ["adjustedFundingRateCap", "adjustedFundingRateFloor", "lastFundingRate"],
-        threshold=0.005,
+        threshold=0.05,
+        migration_key="grvt_funding_baseinfo_rate_pct_to_decimal_v1",
     )
-    _normalize_legacy_bps_columns(
+    _normalize_legacy_grvt_overdivided_history(conn)
+    _normalize_legacy_percent_columns(
         conn,
         "grvt_funding_history",
         ["fundingRate"],
-        threshold=0.005,
+        threshold=0.05,
+        migration_key="grvt_funding_history_rate_pct_to_decimal_v1",
     )
     _normalize_legacy_bps_columns(
         conn,

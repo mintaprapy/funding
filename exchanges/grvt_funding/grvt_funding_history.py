@@ -18,10 +18,10 @@ if str(ROOT_DIR) not in sys.path:
 
 from core.common_funding import (
     RateLimiter,
-    bps_to_decimal_str,
     delete_older_than,
     ensure_history_table,
     load_symbols,
+    pct_to_decimal_str,
 )
 
 BASE_URL = os.getenv("GRVT_BASE_URL", "https://market-data.grvt.io").rstrip("/")
@@ -122,7 +122,7 @@ def save_history(
             (
                 symbol,
                 funding_time,
-                bps_to_decimal_str(item.get("funding_rate") or item.get("rate")),
+                pct_to_decimal_str(item.get("funding_rate") or item.get("rate")),
                 now_ms,
             )
         )

@@ -7,7 +7,6 @@ import os
 import sqlite3
 import sys
 import time
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +18,10 @@ if str(ROOT_DIR) not in sys.path:
 
 from core.common_funding import (
     RateLimiter,
-    bps_to_decimal_str,
     delete_obsolete_symbols,
     ensure_baseinfo_table,
     fetch_existing_symbols,
+    pct_to_decimal_str,
     to_plain_str,
 )
 
@@ -188,21 +187,16 @@ def main() -> None:
             mark_price = to_plain_str(ticker.get("mark_price") or ticker.get("markPrice"))
             open_interest = to_plain_str(ticker.get("open_interest") or ticker.get("openInterest"))
             if open_interest is None:
-                oi_qty = to_plain_str(ticker.get("open_interest_qty") or ticker.get("openInterestQty"))
-                if oi_qty is not None and mark_price is not None:
-                    try:
-                        open_interest = to_plain_str(Decimal(oi_qty) * Decimal(mark_price))
-                    except (InvalidOperation, TypeError, ValueError):
-                        open_interest = None
+                open_interest = to_plain_str(ticker.get("open_interest_qty") or ticker.get("openInterestQty"))
 
             rows.append(
                 (
                     symbol,
-                    bps_to_decimal_str(meta.get("adjusted_funding_rate_cap") or meta.get("funding_rate_upper_limit")),
-                    bps_to_decimal_str(meta.get("adjusted_funding_rate_floor") or meta.get("funding_rate_lower_limit")),
+                    pct_to_decimal_str(meta.get("adjusted_funding_rate_cap") or meta.get("funding_rate_upper_limit")),
+                    pct_to_decimal_str(meta.get("adjusted_funding_rate_floor") or meta.get("funding_rate_lower_limit")),
                     _extract_interval_hours(meta),
                     mark_price,
-                    bps_to_decimal_str(ticker.get("funding_rate") or ticker.get("funding")),
+                    pct_to_decimal_str(ticker.get("funding_rate") or ticker.get("funding")),
                     open_interest,
                     None,
                     now_ms,

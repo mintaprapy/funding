@@ -96,7 +96,7 @@ EXCHANGES: tuple[ExchangeDef, ...] = (
         history_script="grvt_funding_history.py",
         info_table_candidates=("grvt_funding_baseinfo",),
         history_table="grvt_funding_history",
-        open_interest_is_notional=True,
+        open_interest_is_notional=False,
     ),
     ExchangeDef(
         key="standx",
