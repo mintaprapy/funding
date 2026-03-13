@@ -31,6 +31,8 @@ TICKER_PATH = "/full/v1/ticker"
 REQUEST_TIMEOUT = 20
 MAX_REQUEST_ATTEMPTS = 4
 RETRY_BASE_SLEEP = 1.0
+MAX_TICKER_RECOVERY_ROUNDS = 3
+TICKER_RECOVERY_SLEEP_BASE = 3.0
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "grvt_funding_baseinfo"
@@ -129,6 +131,28 @@ def fetch_tickers(
     return out, failed_symbols
 
 
+def recover_failed_tickers(
+    session: requests.Session,
+    tickers: dict[str, dict[str, Any]],
+    failed_symbols: list[str],
+    limiter: RateLimiter,
+) -> list[str]:
+    remaining = failed_symbols[:]
+    for round_idx in range(1, MAX_TICKER_RECOVERY_ROUNDS + 1):
+        if not remaining:
+            break
+        sleep_s = min(15.0, TICKER_RECOVERY_SLEEP_BASE * round_idx)
+        print(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"GRVT ticker 补抓 round {round_idx}/{MAX_TICKER_RECOVERY_ROUNDS}，"
+            f"待补 {len(remaining)} 个；sleep {sleep_s:.1f}s"
+        )
+        time.sleep(sleep_s)
+        recovered, remaining = fetch_tickers(session, remaining, limiter)
+        tickers.update(recovered)
+    return remaining
+
+
 def _extract_interval_hours(item: dict[str, Any]) -> int:
     for key in ("funding_interval_hours", "fundingIntervalHours", "funding_interval", "fundingInterval"):
         v = item.get(key)
@@ -177,6 +201,8 @@ def main() -> None:
         symbols_meta = fetch_symbols(session)
         symbols = sorted(symbols_meta.keys())
         tickers, failed_symbols = fetch_tickers(session, symbols, limiter)
+        if failed_symbols:
+            failed_symbols = recover_failed_tickers(session, tickers, failed_symbols, limiter)
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（GRVT）")
 
         rows: list[tuple[Any, ...]] = []
