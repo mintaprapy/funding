@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import requests
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
 if str(ROOT_DIR) not in sys.path:
@@ -39,15 +43,44 @@ DAYS_TO_KEEP = 60
 PAGE_SIZE = 100
 WINDOW_SECONDS = 60
 WINDOW_CAPACITY = 240
+_REQUESTS_SESSION: requests.Session | None = None
 
 
-def curl_headers() -> tuple[str, ...]:
-    return (
-        "User-Agent: Mozilla/5.0",
-        "Accept: application/json,text/plain,*/*",
-        f"Referer: {BASE_URL}/trade/BTCUSDT",
-        f"Origin: {BASE_URL}",
-    )
+def request_headers() -> dict[str, str]:
+    return {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": f"{BASE_URL}/trade/BTCUSDT",
+        "Origin": BASE_URL,
+    }
+
+
+def requests_session() -> requests.Session:
+    global _REQUESTS_SESSION
+    if _REQUESTS_SESSION is None:
+        _REQUESTS_SESSION = requests.Session()
+        _REQUESTS_SESSION.trust_env = False
+    return _REQUESTS_SESSION
+
+
+def curl_get_json(url: str) -> Any:
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        raise RuntimeError("curl binary not found")
+    cmd = [curl_bin, "-sS", "--compressed", "--max-time", str(REQUEST_TIMEOUT)]
+    for key, value in request_headers().items():
+        cmd.extend(["-H", f"{key}: {value}"])
+    cmd.append(url)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"curl exit {proc.returncode}: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def requests_get_json(url: str) -> Any:
+    resp = requests_session().get(url, headers=request_headers(), timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def edgex_get(path: str, *, params: dict[str, Any] | None = None) -> Any:
@@ -59,16 +92,13 @@ def edgex_get(path: str, *, params: dict[str, Any] | None = None) -> Any:
     last_exc: Exception | None = None
     for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
         try:
-            cmd = ["curl", "-sS", "--compressed", "--max-time", str(REQUEST_TIMEOUT)]
-            for header in curl_headers():
-                cmd.extend(["-H", header])
-            cmd.extend([url])
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode != 0:
-                raise RuntimeError(f"{path} curl exit {proc.returncode}: {proc.stderr.strip()}")
-            import json
-
-            data = json.loads(proc.stdout)
+            try:
+                data = curl_get_json(url)
+            except Exception as curl_exc:  # noqa: BLE001
+                try:
+                    data = requests_get_json(url)
+                except Exception as requests_exc:  # noqa: BLE001
+                    raise RuntimeError(f"curl={curl_exc}; requests={requests_exc}") from requests_exc
             if not isinstance(data, dict):
                 raise RuntimeError(f"{path} 返回格式异常（非 dict）")
             if str(data.get("code") or "").upper() != "SUCCESS":
