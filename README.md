@@ -6,7 +6,7 @@
 
 ```bash
 cd /srv
-git clone git@github.com:mintaprapy/funding.git
+git clone https://github.com/mintaprapy/funding.git
 cd funding
 python3 -m venv .venv
 source .venv/bin/activate
@@ -393,19 +393,19 @@ SELECT 'edgex',    SUM(CASE WHEN markPrice IS NULL OR TRIM(markPrice)='' THEN 1 
 建议优先走这条路径：`git clone -> 安装依赖 -> 先跑一次 --once -> systemd 启动`。
 
 ### 10.1 拉取代码
-SSH 方式：
-
-```bash
-cd /srv
-git clone git@github.com:mintaprapy/funding.git
-cd funding
-```
-
-HTTPS 方式：
+HTTPS 方式（公开仓库，推荐）：
 
 ```bash
 cd /srv
 git clone https://github.com/mintaprapy/funding.git
+cd funding
+```
+
+SSH 方式（如果服务器已经配置好 GitHub SSH key）：
+
+```bash
+cd /srv
+git clone git@github.com:mintaprapy/funding.git
 cd funding
 ```
 
