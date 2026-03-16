@@ -57,9 +57,37 @@ sudo journalctl -u funding-stack -n 100 --no-pager
 sudo systemctl status funding-stack --no-pager
 ```
 
+### 常用服务命令
+
+```bash
+# 查看当前是否正在运行
+sudo systemctl status funding-stack --no-pager
+sudo systemctl is-active funding-stack
+
+# 立即停止服务
+sudo systemctl stop funding-stack
+
+# 取消开机自启，但不停止当前服务
+sudo systemctl disable funding-stack
+
+# 同时停止服务并取消开机自启
+sudo systemctl disable --now funding-stack
+
+# 启动服务
+sudo systemctl start funding-stack
+
+# 恢复开机自启，但不立即启动
+sudo systemctl enable funding-stack
+
+# 立即启动服务，并恢复开机自启
+sudo systemctl enable --now funding-stack
+```
+
 说明：
 - 如果你要只启用部分交易所，先编辑 [config/exchanges.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.json)
 - 如果你要启用告警，先复制 [config/alerts.example.json](/Users/m2/Desktop/Codex2026/Funding/config/alerts.example.json) 为服务器本地的 `config/alerts.json`，再填写真实 webhook
+- `disable` 只取消开机自启，不会停止当前已经在跑的服务；要停掉当前服务请用 `stop` 或 `disable --now`
+- `enable` 只恢复开机自启，不会立刻启动当前服务；要立即启动请用 `start` 或 `enable --now`
 - 更完整的部署说明见下文“GitHub 首页部署步骤”
 
 ## 1. 项目简介
@@ -454,6 +482,24 @@ sudo systemctl enable --now funding-stack
 sudo systemctl status funding-stack
 ```
 
+常用控制命令：
+
+```bash
+sudo systemctl status funding-stack --no-pager
+sudo systemctl stop funding-stack
+sudo systemctl disable funding-stack
+sudo systemctl disable --now funding-stack
+sudo systemctl start funding-stack
+sudo systemctl enable funding-stack
+sudo systemctl enable --now funding-stack
+sudo journalctl -u funding-stack -f
+```
+
+说明：
+- `disable` 只取消开机自启，不会停止当前服务
+- `enable` 只恢复开机自启，不会立即启动当前服务
+- 如果你之前执行过 `mask`，恢复前先执行 `sudo systemctl unmask funding-stack`
+
 ### 10.5 后续更新代码
 服务器上后续更新代码时，直接执行：
 
@@ -499,6 +545,27 @@ sudo journalctl -u funding-stack -f
 - `Environment=FUNDING_ALERT_CONFIG=...`（默认可用 `/srv/funding/config/alerts.json`）
 - `Environment=FUNDING_DB_PATH=...`
 - `ExecStart`
+
+常用运维命令：
+
+```bash
+sudo systemctl status funding-stack --no-pager
+sudo systemctl is-active funding-stack
+sudo systemctl stop funding-stack
+sudo systemctl disable funding-stack
+sudo systemctl disable --now funding-stack
+sudo systemctl start funding-stack
+sudo systemctl enable funding-stack
+sudo systemctl enable --now funding-stack
+sudo journalctl -u funding-stack -n 200 --no-pager
+sudo journalctl -u funding-stack -f
+```
+
+补充说明：
+- `disable` 不会停止当前已经在跑的实例，只会取消开机自启
+- `enable` 不会自动把当前服务拉起，只会恢复开机自启
+- 需要立即停掉当前服务时，用 `stop` 或 `disable --now`
+- 需要立即启动并恢复自启时，用 `start` 或 `enable --now`
 
 ## 12. 本地长跑日志清理
 如果你在本地做过 `10h / 12h` 这类长时间测试，`logs/` 目录里会保留报告、日志和快照。
