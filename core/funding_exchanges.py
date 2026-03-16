@@ -20,6 +20,7 @@ class ExchangeDef:
     info_table_candidates: tuple[str, ...]
     history_table: str
     open_interest_is_notional: bool
+    open_interest_notional_multiplier: float = 1.0
 
 
 EXCHANGES_DIR = "exchanges"
@@ -57,6 +58,7 @@ EXCHANGES: tuple[ExchangeDef, ...] = (
         info_table_candidates=("aster_funding_baseinfo",),
         history_table="aster_funding_history",
         open_interest_is_notional=False,
+        open_interest_notional_multiplier=2.0,
     ),
     ExchangeDef(
         key="hyperliquid",
@@ -117,6 +119,7 @@ EXCHANGES: tuple[ExchangeDef, ...] = (
         info_table_candidates=("lighter_funding_baseinfo",),
         history_table="lighter_funding_history",
         open_interest_is_notional=False,
+        open_interest_notional_multiplier=2.0,
     ),
     ExchangeDef(
         key="gate",
@@ -226,6 +229,7 @@ def dashboard_exchange_meta(root: Path, config_path: str | Path | None = None) -
             "info_table_candidates": list(item.info_table_candidates),
             "history_table": item.history_table,
             "open_interest_is_notional": item.open_interest_is_notional,
+            "open_interest_notional_multiplier": item.open_interest_notional_multiplier,
         }
         for item in enabled_exchanges(root, config_path)
     }

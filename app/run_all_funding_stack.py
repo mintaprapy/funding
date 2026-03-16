@@ -32,7 +32,9 @@ from core.funding_exchanges import (
 )
 
 FUNDING_DB_PATH_ENV = "FUNDING_DB_PATH"
+FUNDING_ALERT_CONFIG_ENV = "FUNDING_ALERT_CONFIG"
 DEFAULT_DB_PATH = ROOT / "funding.db"
+DEFAULT_ALERT_CONFIG = ROOT / "config" / "alerts.json"
 BASEINFO_FRAGILE_EXCHANGES = frozenset({"grvt", "standx"})
 HISTORY_FRAGILE_EXCHANGES = frozenset({"grvt", "edgex"})
 HISTORY_DEDICATED_LANES = {"binance": "binance"}
@@ -251,7 +253,7 @@ def run_batch(
     retry_wait_s: float = 3.0,
     script_timeout_s: float = 1800.0,
     script_exchange_keys: dict[Path, str] | None = None,
-    baseinfo_general_workers: int = 2,
+    baseinfo_general_workers: int = 4,
     history_general_workers: int = 2,
     fragile_workers: int = 1,
 ) -> None:
@@ -476,7 +478,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseinfo-general-workers",
         type=int,
-        default=2,
+        default=4,
         help="Concurrent workers for non-fragile baseinfo scripts",
     )
     parser.add_argument(
@@ -491,6 +493,17 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Concurrent workers for fragile exchange lanes",
     )
+    parser.add_argument(
+        "--alert-config",
+        default=os.getenv(FUNDING_ALERT_CONFIG_ENV, str(DEFAULT_ALERT_CONFIG)),
+        help="JSON config path controlling alert thresholds/providers (defaults to FUNDING_ALERT_CONFIG or config/alerts.json)",
+    )
+    parser.add_argument(
+        "--alert-minutes",
+        default="0,5,10,15,20,25,30,35,40,45,50,55",
+        help="Comma-separated minute list for alert checks",
+    )
+    parser.add_argument("--disable-alerts", action="store_true", help="Do not run alert checks")
     return parser.parse_args()
 
 
@@ -498,7 +511,9 @@ def main() -> None:
     args = parse_args()
     baseinfo_minutes = parse_minutes(args.baseinfo_minutes)
     history_minutes = parse_minutes(args.history_minutes)
+    alert_minutes = parse_minutes(args.alert_minutes)
     exchange_config_path = Path(args.exchange_config).expanduser().resolve()
+    alert_config_path = Path(args.alert_config).expanduser().resolve()
     try:
         selected_exchanges = enabled_exchanges(ROOT, exchange_config_path)
     except RuntimeError as exc:
@@ -510,6 +525,8 @@ def main() -> None:
     for item in selected_exchanges:
         script_exchange_keys[(ROOT / item.folder / item.baseinfo_script).resolve()] = item.key
         script_exchange_keys[(ROOT / item.folder / item.history_script).resolve()] = item.key
+    alert_script = (ROOT / "app" / "funding_alerts.py").resolve()
+    script_exchange_keys[alert_script] = "__alerts__"
 
     stop_requested = False
 
@@ -530,6 +547,8 @@ def main() -> None:
         Job(name="baseinfo", minutes=baseinfo_minutes, scripts=baseinfo_scripts),
         Job(name="history", minutes=history_minutes, scripts=history_scripts),
     ]
+    if not args.disable_alerts:
+        jobs.append(Job(name="alerts", minutes=alert_minutes, scripts=[alert_script]))
 
     try:
         try:
@@ -541,12 +560,15 @@ def main() -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         os.environ[FUNDING_DB_PATH_ENV] = str(db_path)
         os.environ[EXCHANGE_CONFIG_ENV] = str(exchange_config_path)
+        os.environ[FUNDING_ALERT_CONFIG_ENV] = str(alert_config_path)
         log(f"[{now_str()}] runtime database: {db_path}")
         log(
             f"[{now_str()}] enabled exchanges ({len(selected_exchanges)}): "
             + ", ".join(item.label for item in selected_exchanges)
         )
         log(f"[{now_str()}] exchange config: {exchange_config_path}")
+        if not args.disable_alerts:
+            log(f"[{now_str()}] alert config: {alert_config_path}")
         prepare_sqlite_runtime(db_path)
 
         if not args.skip_dashboard:
@@ -591,6 +613,22 @@ def main() -> None:
             )
             if stop_requested:
                 return
+            if not args.disable_alerts:
+                run_batch(
+                    "alerts(startup)",
+                    args.python,
+                    [alert_script],
+                    should_stop=lambda: stop_requested,
+                    max_attempts=1,
+                    retry_wait_s=args.script_retry_wait,
+                    script_timeout_s=30.0,
+                    script_exchange_keys=script_exchange_keys,
+                    baseinfo_general_workers=args.baseinfo_general_workers,
+                    history_general_workers=args.history_general_workers,
+                    fragile_workers=args.fragile_workers,
+                )
+                if stop_requested:
+                    return
 
         if args.once:
             return

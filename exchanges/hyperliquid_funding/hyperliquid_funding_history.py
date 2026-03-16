@@ -24,6 +24,8 @@ HISTORY_TABLE = "hyperliquid_funding_history"
 
 DAYS_TO_FETCH = 30
 DAYS_TO_KEEP = 60
+MAX_REQUEST_ATTEMPTS = 6
+RETRY_BASE_SLEEP = 2.0
 
 # Hyperliquid fundingHistory 单次返回可能被截断（实测上限约 500 条），按时间分块请求。
 # 20 天 * 24 小时 ≈ 480 条，通常可避免触发截断并减少请求次数。
@@ -237,14 +239,16 @@ def fetch_symbol_history(
 
 
 def _hl_post_with_retry(session: requests.Session, payload: dict[str, Any]) -> Any:
-    backoff = 2.0
+    backoff = RETRY_BASE_SLEEP
     max_backoff = 60.0
-    for attempt in range(6):
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
         try:
             return hl_post(session, payload)
         except requests.HTTPError as exc:
+            last_exc = exc
             status = getattr(exc.response, "status_code", None)
-            if status != 429 or attempt >= 5:
+            if status not in {408, 409, 425, 429, 500, 502, 503, 504} or attempt >= MAX_REQUEST_ATTEMPTS:
                 raise
             retry_after = None
             if exc.response is not None:
@@ -255,6 +259,13 @@ def _hl_post_with_retry(session: requests.Session, payload: dict[str, Any]) -> A
                 sleep_for = backoff
             time.sleep(min(max_backoff, max(1.0, sleep_for)))
             backoff = min(max_backoff, backoff * 2)
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt >= MAX_REQUEST_ATTEMPTS:
+                raise
+            time.sleep(min(max_backoff, max(1.0, backoff)))
+            backoff = min(max_backoff, backoff * 2)
+    raise RuntimeError(f"Hyperliquid 请求失败，payload={payload}; last_error={last_exc}") from last_exc
 
 
 def main() -> None:
@@ -274,6 +285,9 @@ def main() -> None:
         symbols = load_symbols(conn)
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]共 {len(symbols)} 个交易对，开始拉取近 {DAYS_TO_FETCH} 天资金费率")
 
+        wrote_any = False
+        failed_symbols: list[str] = []
+        incomplete_symbols: list[str] = []
         for idx, symbol in enumerate(symbols, 1):
             existing = load_existing_buckets(
                 conn,
@@ -294,11 +308,13 @@ def main() -> None:
                 records = fetch_symbol_history(session, limiter, symbol, symbol_start_ms, end_ms)
             except Exception as exc:  # noqa: BLE001
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] {symbol} 获取失败：{exc}")
+                failed_symbols.append(symbol)
                 continue
 
             inserted = save_history(conn, symbol, records, now_ms=end_ms)
             delete_older_than(conn, cutoff_ms, [symbol])
             conn.commit()
+            wrote_any = wrote_any or inserted > 0
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] {symbol} 入库 {inserted} 条")
 
             # 回补后再检查一次是否仍有缺口（用于提醒是否仍需等待最新数据产生）
@@ -318,6 +334,19 @@ def main() -> None:
                 print(
                     f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] {symbol} 仍缺 {len(missing_after)} 个小时数据：{first} ~ {last}"
                 )
+                if records:
+                    incomplete_symbols.append(symbol)
+
+        if not wrote_any:
+            raise RuntimeError("Hyperliquid history 未写入任何记录")
+        if failed_symbols:
+            preview = ",".join(failed_symbols[:10])
+            suffix = "" if len(failed_symbols) <= 10 else f" ... total={len(failed_symbols)}"
+            raise RuntimeError(f"Hyperliquid history 存在未成功拉取的交易对: {preview}{suffix}")
+        if incomplete_symbols:
+            preview = ",".join(incomplete_symbols[:10])
+            suffix = "" if len(incomplete_symbols) <= 10 else f" ... total={len(incomplete_symbols)}"
+            raise RuntimeError(f"Hyperliquid history 仍存在数据缺口的交易对: {preview}{suffix}")
 
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]同步完成")
 

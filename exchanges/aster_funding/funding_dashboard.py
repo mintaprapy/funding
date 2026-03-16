@@ -18,6 +18,7 @@ INFO_TABLE_CANDIDATES = ["aster_funding_baseinfo"]
 HISTORY_TABLE = "aster_funding_history"
 HOST = "0.0.0.0"
 PORT = 8000
+OPEN_INTEREST_NOTIONAL_MULTIPLIER = 2.0
 
 # key, window in ms, label for UI
 WINDOWS = [
@@ -145,7 +146,7 @@ def build_payload() -> dict[str, Any]:
         sums = sums_by_symbol.get(row["symbol"], {key: 0.0 for key, _, _ in WINDOWS})
         oi = row.get("openInterest")
         mp = row.get("markPrice")
-        notional = oi * mp if oi is not None and mp is not None else None
+        notional = oi * mp * OPEN_INTEREST_NOTIONAL_MULTIPLIER if oi is not None and mp is not None else None
         items.append({**row, "openInterestNotional": notional, "sums": sums})
 
     return {
@@ -623,4 +624,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

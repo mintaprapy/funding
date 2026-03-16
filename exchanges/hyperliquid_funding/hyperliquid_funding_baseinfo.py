@@ -4,7 +4,7 @@
 从 Hyperliquid 公共 API 获取永续合约基础信息，并写入 SQLite。
 
 数据落库到共享 funding.db 的 hyperliquid_funding_baseinfo 表：
-- symbol（这里用 coin 名称，例如 BTC / ETH）
+- symbol（这里用 coin 名称，例如 BTC / ETH；builder perp dex 为 xyz:CL 这类前缀名）
 - markPrice（标记价格）
 - lastFundingRate（最新资金费率；通常为每小时费率）
 - fundingIntervalHours（结算周期小时，默认 1h）
@@ -62,8 +62,7 @@ def hl_post(session: requests.Session, payload: dict[str, Any]) -> Any:
     return resp.json()
 
 
-def fetch_meta_and_asset_ctxs(session: requests.Session) -> tuple[list[str], dict[str, dict[str, Any]]]:
-    data = hl_post(session, {"type": "metaAndAssetCtxs"})
+def _parse_meta_and_asset_ctxs_payload(data: Any) -> tuple[list[str], dict[str, dict[str, Any]]]:
     if not isinstance(data, list) or len(data) < 2:
         raise RuntimeError("metaAndAssetCtxs 返回格式异常（期望 [meta, assetCtxs]）")
 
@@ -89,9 +88,6 @@ def fetch_meta_and_asset_ctxs(session: requests.Session) -> tuple[list[str], dic
                 ctx_map[name] = asset_ctxs[idx]
 
     symbols = sorted(set(symbols))
-    if not symbols:
-        raise RuntimeError("未获取到任何可用交易对（universe 为空）")
-
     # 若索引映射未命中（或 API 形态变化），回退到基于 coin/name/symbol 字段的映射。
     if not ctx_map:
         for ctx in asset_ctxs:
@@ -102,6 +98,67 @@ def fetch_meta_and_asset_ctxs(session: requests.Session) -> tuple[list[str], dic
                 ctx_map[key] = ctx
 
     return symbols, ctx_map
+
+
+def _infer_perp_dex_name(meta: dict[str, Any]) -> str | None:
+    universe = meta.get("universe")
+    if not isinstance(universe, list):
+        return None
+    for item in universe:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("coin") or item.get("symbol")
+        if not isinstance(name, str) or not name:
+            continue
+        if ":" not in name:
+            return None
+        return name.split(":", 1)[0]
+    return None
+
+
+def discover_perp_dexes(session: requests.Session) -> list[str | None]:
+    data = hl_post(session, {"type": "allPerpMetas"})
+    if not isinstance(data, list):
+        return [None]
+
+    out: list[str | None] = []
+    seen: set[str] = set()
+    for meta in data:
+        if not isinstance(meta, dict):
+            continue
+        dex = _infer_perp_dex_name(meta)
+        key = dex or "__main__"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dex)
+
+    if "__main__" not in seen:
+        out.insert(0, None)
+    return out or [None]
+
+
+def fetch_meta_and_asset_ctxs(session: requests.Session) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    all_symbols: list[str] = []
+    all_ctx_map: dict[str, dict[str, Any]] = {}
+
+    for dex in discover_perp_dexes(session):
+        payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
+        if dex:
+            payload["dex"] = dex
+        symbols, ctx_map = _parse_meta_and_asset_ctxs_payload(hl_post(session, payload))
+        if not symbols:
+            continue
+        for symbol in symbols:
+            if symbol not in all_ctx_map:
+                all_symbols.append(symbol)
+            if symbol in ctx_map:
+                all_ctx_map[symbol] = ctx_map[symbol]
+
+    deduped_symbols = sorted(set(all_symbols))
+    if not deduped_symbols:
+        raise RuntimeError("未获取到任何可用交易对（main/builder perp dex universe 为空）")
+    return deduped_symbols, all_ctx_map
 
 
 def ensure_table(conn: sqlite3.Connection) -> None:

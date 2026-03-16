@@ -623,6 +623,9 @@ def _build_payload_uncached() -> dict[str, Any]:
                     notional = oi
                 else:
                     notional = oi * mp if oi is not None and mp is not None else None
+                multiplier = _to_number(meta.get("open_interest_notional_multiplier")) or 1.0
+                if notional is not None:
+                    notional *= multiplier
                 items.append(
                     {
                         **row,
@@ -680,7 +683,7 @@ def _render_html(*, static_payload_json: str) -> str:
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Funding Dashboard (All)</title>
+  <title>资金费率</title>
   <style>
     :root {{
       --bg: #0e172a;
@@ -714,14 +717,13 @@ def _render_html(*, static_payload_json: str) -> str:
     header {{
       display: flex;
       align-items: center;
-      justify-content: space-between;
       gap: 16px;
       margin-bottom: 22px;
     }}
     .hero {{
       display: flex;
-      flex-direction: column;
-      gap: 8px;
+      align-items: center;
+      gap: 12px;
     }}
     h1 {{
       margin: 0;
@@ -749,6 +751,13 @@ def _render_html(*, static_payload_json: str) -> str:
       flex-wrap: wrap;
       gap: 12px;
       margin-bottom: 18px;
+    }}
+    .header-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      flex: 1;
+      justify-content: flex-end;
     }}
     .pill {{
       background: var(--card);
@@ -825,6 +834,12 @@ def _render_html(*, static_payload_json: str) -> str:
       gap: 8px;
       cursor: pointer;
     }}
+    .exchange-copy {{
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }}
     .exchange-choice input {{
       width: 14px;
       height: 14px;
@@ -842,6 +857,11 @@ def _render_html(*, static_payload_json: str) -> str:
       font-size: 12px;
       font-family: 'Menlo', 'SFMono-Regular', Consolas, monospace;
       line-height: 1;
+    }}
+    .exchange-choice .choice-meta {{
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
     }}
     .badge {{
       display: inline-flex;
@@ -973,6 +993,8 @@ def _render_html(*, static_payload_json: str) -> str:
     }}
     @media (max-width: 900px) {{
       header {{ flex-direction: column; align-items: flex-start; }}
+      .hero {{ align-items: flex-start; }}
+      .header-controls {{ width: 100%; justify-content: flex-start; }}
       .controls {{ flex-direction: column; }}
       .pill {{ width: 100%; }}
       .exchange-pill {{ min-width: 0; }}
@@ -985,29 +1007,23 @@ def _render_html(*, static_payload_json: str) -> str:
     <header>
       <div class="hero">
         <h1>Funding Dashboard</h1>
-        <div class="sub"> Binance / Bybit / Aster / Hyperliquid / Backpack / Ethereal / GRVT / StandX / Lighter / Gate / Bitget / Variational / edgeX 永续合约资金费率 </div>
+        <div class="header-controls">
+          <div class="pill">
+            <label for="searchBox">搜索</label>
+            <input id="searchBox" type="text" placeholder="BTC || BTC/" />
+          </div>
+          <div class="pill range-pill">
+            <div class="range-title">持仓量 &gt; <span id="oiFilterLabel">3</span>M</div>
+            <input id="oiFilter" type="range" min="0" max="7" step="1" value="2" />
+          </div>
+        </div>
       </div>
-      <div class="chip" id="summaryChip">加载中…</div>
     </header>
 
     <div class="controls">
       <div class="pill exchange-pill">
-        <label>交易所</label>
-        <div class="exchange-tools">
-          <button type="button" class="exchange-action" id="exchangeSelectAll">全选</button>
-          <button type="button" class="exchange-action" id="exchangeInvert">反选</button>
-        </div>
         <div class="exchange-group" id="exchangeChoices"></div>
       </div>
-      <div class="pill">
-        <label for="searchBox">搜索交易对</label>
-        <input id="searchBox" type="text" placeholder="如 BTC，精确搜索用 BTC/" />
-      </div>
-      <div class="pill range-pill">
-        <div class="range-title">持仓量 &gt; <span id="oiFilterLabel">0</span>M</div>
-        <input id="oiFilter" type="range" min="0" max="7" step="1" value="0" />
-      </div>
-      <div class="badge" id="lastUpdated">更新中…</div>
     </div>
 
     <div class="table-wrap">
@@ -1069,9 +1085,10 @@ def _render_html(*, static_payload_json: str) -> str:
     let dataCache = [];
     let sortKey = 'symbol';
     let sortDir = 'asc';
-    let oiThresholdIdx = 0;
+    let oiThresholdIdx = 2;
     let selectedExchanges = new Set(EXCHANGES_META.map(x => x.key));
     let exchangeCounts = {{}};
+    let exchangeUpdatedAt = {{}};
     let fixedColumnsApplied = false;
     let renderVersion = 0;
     let scheduledRender = null;
@@ -1121,25 +1138,41 @@ def _render_html(*, static_payload_json: str) -> str:
       return selectedExchanges.size === EXCHANGES_META.length;
     }}
 
+    function formatExchangeUpdatedAt(ts) {{
+      if (!ts) return '—';
+      const d = new Date(ts);
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mi = String(d.getMinutes()).padStart(2, '0');
+      return `${'{'}mm{'}'}${'{'}dd{'}'} ${'{'}hh{'}'}:${'{'}mi{'}'}`;
+    }}
+
     function renderExchangeChoices() {{
       const group = document.getElementById('exchangeChoices');
       if (!group) return;
       const totalCount = dataCache.length;
       const items = [
-        {{ key: 'all', label: '全部', count: totalCount, checked: allExchangesSelected() }},
+        {{ key: 'all', label: '全部', count: totalCount, checked: allExchangesSelected(), meta: '' }},
         ...EXCHANGES_META.map(x => ({{
           key: x.key,
           label: x.label,
           count: exchangeCounts[x.key] || 0,
           checked: selectedExchanges.has(x.key),
+          meta: formatExchangeUpdatedAt(exchangeUpdatedAt[x.key]),
         }})),
       ];
       group.innerHTML = items.map(item => `
         <div class="exchange-choice ${'{'}item.checked ? 'active' : ''{'}'}" data-key="${'{'}item.key{'}'}">
           <label class="exchange-main">
             <input type="checkbox" ${'{'}item.checked ? 'checked' : ''{'}'} />
-            <span class="choice-text">${'{'}item.label{'}'}</span>
-            <span class="choice-count">${'{'}item.count{'}'}</span>
+            <span class="exchange-copy">
+              <span>
+                <span class="choice-text">${'{'}item.label{'}'}</span>
+                <span class="choice-count">${'{'}item.count{'}'}</span>
+              </span>
+              ${'{'}item.meta ? `<span class="choice-meta">${'{'}item.meta{'}'}</span>` : ''{'}'}
+            </span>
           </label>
         </div>
       `).join('');
@@ -1217,16 +1250,16 @@ def _render_html(*, static_payload_json: str) -> str:
     }}
 
     function updateMeta(payload) {{
-      const chip = document.getElementById('summaryChip');
       const footer = document.getElementById('footerText');
-      const updated = new Date(payload.generatedAt || Date.now());
-      const total = dataCache.length;
       const counts = {{}};
+      const updatedMap = {{}};
       dataCache.forEach(it => counts[it.exchange] = (counts[it.exchange] || 0) + 1);
+      dataCache.forEach(it => {{
+        if (it.updated_at == null) return;
+        updatedMap[it.exchange] = Math.max(updatedMap[it.exchange] || 0, Number(it.updated_at));
+      }});
       exchangeCounts = counts;
-      const parts = EXCHANGES_META.map(x => `${'{'}x.label{'}'} ${{counts[x.key] || 0}}`).join(' · ');
-      chip.textContent = `共 ${{total}} 个交易对（${'{'}parts{'}'}）`;
-      document.getElementById('lastUpdated').textContent = `生成时间：${'{'}updated.toLocaleString(){'}'}`;
+      exchangeUpdatedAt = updatedMap;
       footer.textContent = '历史数据 1 小时更新一次，其他数据 10 分钟更新一次';
       renderExchangeChoices();
     }}
@@ -1368,17 +1401,6 @@ def _render_html(*, static_payload_json: str) -> str:
     document.getElementById('searchBox').addEventListener('input', () => {{
       if (searchDebounce) clearTimeout(searchDebounce);
       searchDebounce = setTimeout(render, 80);
-    }});
-    document.getElementById('exchangeSelectAll').addEventListener('click', () => {{
-      selectedExchanges = new Set(EXCHANGES_META.map(x => x.key));
-      renderExchangeChoices();
-      render();
-    }});
-    document.getElementById('exchangeInvert').addEventListener('click', () => {{
-      const inverted = EXCHANGES_META.filter(x => !selectedExchanges.has(x.key)).map(x => x.key);
-      selectedExchanges = new Set(inverted);
-      renderExchangeChoices();
-      render();
     }});
 
     const oiFilter = document.getElementById('oiFilter');

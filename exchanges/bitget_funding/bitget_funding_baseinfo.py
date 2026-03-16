@@ -28,6 +28,7 @@ from core.common_funding import (
 BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com").rstrip("/")
 CONTRACTS_PATH = "/api/v2/mix/market/contracts"
 TICKERS_PATH = "/api/v2/mix/market/tickers"
+CURRENT_FUND_RATE_PATH = "/api/v2/mix/market/current-fund-rate"
 REQUEST_TIMEOUT = 20
 MAX_HTTP_ATTEMPTS = 4
 
@@ -102,6 +103,22 @@ def fetch_tickers(session: requests.Session) -> dict[str, dict[str, Any]]:
     return out
 
 
+def fetch_current_funding_rates(session: requests.Session) -> dict[str, dict[str, Any]]:
+    payload = bitget_get(session, CURRENT_FUND_RATE_PATH, params={"productType": PRODUCT_TYPE})
+    items = payload.get("data")
+    if not isinstance(items, list):
+        raise RuntimeError("Bitget current-fund-rate data 返回格式异常（非 list）")
+
+    out: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            out[symbol] = item
+    return out
+
+
 def calc_open_interest_notional(contract: dict[str, Any], ticker: dict[str, Any]) -> str | None:
     direct = to_plain_str(
         ticker.get("openInterestUsd") or ticker.get("holdingAmountUsd") or ticker.get("openInterestValue")
@@ -161,6 +178,7 @@ def main() -> None:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（Bitget）")
 
         tickers = fetch_tickers(session)
+        funding_rates = fetch_current_funding_rates(session)
 
         rows: list[tuple[Any, ...]] = []
         missing = 0
@@ -170,9 +188,14 @@ def main() -> None:
             if not ticker:
                 missing += 1
                 continue
+            funding_rate = funding_rates.get(symbol, {})
 
             interval_hours = 8
-            interval = contract.get("fundInterval") or contract.get("fundingInterval")
+            interval = (
+                funding_rate.get("fundingRateInterval")
+                or contract.get("fundInterval")
+                or contract.get("fundingInterval")
+            )
             if isinstance(interval, str):
                 try:
                     iv = float(interval)
@@ -192,11 +215,23 @@ def main() -> None:
             rows.append(
                 (
                     symbol,
-                    to_plain_str(contract.get("maxFundingRate") or contract.get("fundingRateCap")),
-                    to_plain_str(contract.get("minFundingRate") or contract.get("fundingRateFloor")),
+                    to_plain_str(
+                        funding_rate.get("maxFundingRate")
+                        or contract.get("maxFundingRate")
+                        or contract.get("fundingRateCap")
+                    ),
+                    to_plain_str(
+                        funding_rate.get("minFundingRate")
+                        or contract.get("minFundingRate")
+                        or contract.get("fundingRateFloor")
+                    ),
                     interval_hours,
                     to_plain_str(ticker.get("markPrice") or ticker.get("lastPr") or ticker.get("indexPrice")),
-                    to_plain_str(ticker.get("fundingRate") or ticker.get("capitalRate")),
+                    to_plain_str(
+                        funding_rate.get("fundingRate")
+                        or ticker.get("fundingRate")
+                        or ticker.get("capitalRate")
+                    ),
                     calc_open_interest_notional(contract, ticker),
                     None,
                     now_ms,

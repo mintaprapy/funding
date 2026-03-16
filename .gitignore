@@ -7,6 +7,7 @@ __pycache__/
 funding.db
 funding.db-shm
 funding.db-wal
+config/alerts.json
 
 *.log
 .run_all_funding_stack.lock
