@@ -10,9 +10,10 @@ git clone https://github.com/mintaprapy/funding.git
 cd funding
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip requests
+pip install -U pip requests websockets certifi
 
 # 如需只启用部分交易所，先改配置
+# cp config/exchanges.example.json config/exchanges.json
 # vim config/exchanges.json
 
 # 如需启用告警：先复制示例文件，再填写真实配置
@@ -33,9 +34,10 @@ sudo systemctl enable --now funding-stack
 cd /srv/funding
 git pull
 source .venv/bin/activate
-pip install -U pip requests
+pip install -U pip requests websockets certifi
 
 # 如果改了交易所配置，改仓库内文件
+# cp config/exchanges.example.json config/exchanges.json
 # vim config/exchanges.json
 
 # 如果改了告警配置，改服务器本地文件
@@ -111,7 +113,7 @@ sudo systemctl enable --now funding-stack
 ## 2. 运行依赖
 依赖很轻量：
 - Python 3.10+（建议 3.11）
-- 第三方包：`requests`
+- 第三方包：`requests`、`websockets`、`certifi`
 - 其余均为 Python 标准库
 
 安装示例：
@@ -119,7 +121,7 @@ sudo systemctl enable --now funding-stack
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip requests
+pip install -U pip requests websockets certifi
 ```
 
 ## 3. 目录与入口
@@ -127,7 +129,7 @@ pip install -U pip requests
 - 应用入口目录：`app/`
 - 公共模块目录：`core/`
 - 交易所采集脚本目录：`exchanges/`
-- 启用交易所配置：`config/exchanges.json`
+- 启用交易所配置：`config/exchanges.json`（可由 `config/exchanges.example.json` 复制）
 - 本地辅助脚本目录：`scripts/`
 - systemd 模板目录：`systemd/`
 - 运行数据库：`funding.db`
@@ -164,6 +166,7 @@ Funding/
 │   ├── variational_funding/
 │   └── edgex_funding/
 ├── config/
+│   ├── exchanges.example.json
 │   ├── exchanges.json
 │   └── alerts.example.json
 ├── scripts/
@@ -178,6 +181,7 @@ Funding/
 - `core/`：公共 SQLite、限速、交易所注册表等共享代码
 - `exchanges/`：各交易所的 `baseinfo`、`history`、单交易所 dashboard
 - `config/exchanges.json`：控制启动时启用哪些交易所
+- `config/exchanges.example.json`：交易所配置示例文件，方便线上先复制再修改
 - `config/alerts.example.json`：告警配置示例文件，可复制为服务器本地的 `config/alerts.json`
 - `scripts/`：本地辅助脚本，例如清理长时间测试生成的日志控制文件
 - `systemd/`：线上部署用服务模板
@@ -190,7 +194,14 @@ Funding/
 - `config/exchanges.json`
 - `config/alerts.json`（服务器本地真实文件） / `FUNDING_ALERT_CONFIG` / `--alert-config`
 
-如果你要控制只启用部分交易所，直接编辑 [config/exchanges.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.json)：
+如果你要控制只启用部分交易所，可以先复制示例文件，再编辑 [config/exchanges.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.json)：
+
+```bash
+cp config/exchanges.example.json config/exchanges.json
+vim config/exchanges.json
+```
+
+配置内容示例：
 
 ```json
 {
@@ -200,7 +211,7 @@ Funding/
 
 说明：
 - 配置文件不存在时，默认启用全部交易所
-- 仓库当前自带这份文件，默认启用全部 13 家交易所
+- 仓库当前自带 [config/exchanges.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.json) 和 [config/exchanges.example.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.example.json)，默认启用全部 13 家交易所
 - 这里的 key 必须使用小写：如 `binance`、`grvt`、`variational`、`edgex`
 - 调度器和总 dashboard 会共用这份配置
 
@@ -279,7 +290,7 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 - `Binance` 的 `history` 脚本中途可能出现约 `7~8` 分钟无新日志输出，这是为规避 API 限频而设计的等待窗口；单独回补时不要误判为卡死
 - `edgeX` 的 `baseinfo` 首轮会比其他交易所慢一些，因为它需要逐合约拉取 ticker
 - `Variational` 的 `funding_rate` 来自年化值，代码会自动换算成单结算周期资金费率后再展示
-- `config/exchanges.json` 可以控制只启用部分交易所，调度器和总 dashboard 会共用这份配置
+- `config/exchanges.json` 可以控制只启用部分交易所，仓库也提供了 [config/exchanges.example.json](/Users/m2/Desktop/Codex2026/Funding/config/exchanges.example.json) 方便线上复制后修改
 - 调度器支持按阈值发 Telegram / 飞书通知；仓库建议只提交示例文件，服务器本地维护真实 `config/alerts.json`
 - 搜索框末尾加 `/` 表示精确搜索，例如 `BTC/`
 - 交易所筛选支持多选，`24h / 3d / 7d / 15d / 30d` 的 `—` 在排序时统一排在最后
@@ -307,7 +318,9 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
   "max_items_per_run": 20,
   "open_interest_min_musd": 3,
   "latest_abs_pct_gte": 0.5,
+  "latest_abs_pct_lte": null,
   "h4_abs_pct_gte": 1.0,
+  "h4_abs_pct_lte": null,
   "providers": {
     "telegram": {
       "enabled": true,
@@ -327,8 +340,10 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 
 规则说明：
 - `open_interest_min_musd`：持仓量最小值，单位是 `M$`；只有持仓量大于等于这个值的交易对，才会参与告警判断
-- `latest_abs_pct_gte`：最新单次资金费率绝对值达到这个百分比时告警
-- `h4_abs_pct_gte`：过去 4 小时累计资金费率绝对值达到这个百分比时告警
+- `latest_abs_pct_gte`：最新单次资金费率绝对值大于等于这个百分比时告警；留空或 `null` 表示不启用
+- `latest_abs_pct_lte`：最新单次资金费率绝对值小于等于这个百分比时告警；留空或 `null` 表示不启用
+- `h4_abs_pct_gte`：过去 4 小时累计资金费率绝对值大于等于这个百分比时告警；留空或 `null` 表示不启用
+- `h4_abs_pct_lte`：过去 4 小时累计资金费率绝对值小于等于这个百分比时告警；留空或 `null` 表示不启用
 - `cooldown_minutes`：同一条告警在冷却时间内不会重复发送
 - `max_items_per_run`：单次通知最多展开多少条命中项
 
@@ -442,7 +457,7 @@ cd funding
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip requests
+pip install -U pip requests websockets certifi
 ```
 
 ### 10.3 首次空库预热
@@ -507,7 +522,7 @@ sudo journalctl -u funding-stack -f
 cd /srv/funding
 git pull
 source .venv/bin/activate
-pip install -U pip requests
+pip install -U pip requests websockets certifi
 sudo systemctl restart funding-stack
 ```
 

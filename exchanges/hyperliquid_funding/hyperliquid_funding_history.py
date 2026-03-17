@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from collections import deque
 from decimal import Decimal, InvalidOperation
@@ -18,6 +19,15 @@ INFO_PATH = "/info"
 REQUEST_TIMEOUT = 15
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
+)
+
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 INFO_TABLE = "hyperliquid_funding_baseinfo"
 HISTORY_TABLE = "hyperliquid_funding_history"
@@ -283,7 +293,7 @@ def main() -> None:
     with sqlite3.connect(DB_PATH) as conn, requests.Session() as session:
         ensure_history_table(conn)
         symbols = load_symbols(conn)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]共 {len(symbols)} 个交易对，开始拉取近 {DAYS_TO_FETCH} 天资金费率")
+        collector_log_start("Hyperliquid", "history", detail=f"{len(symbols)} 个交易对，近 {DAYS_TO_FETCH} 天资金费率")
 
         wrote_any = False
         failed_symbols: list[str] = []
@@ -297,7 +307,7 @@ def main() -> None:
             )
             missing = [b for b in range(start_bucket, end_bucket + 1) if b not in existing]
             if not missing:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] {symbol} 数据齐全，跳过")
+                collector_log_progress("Hyperliquid", "history", detail=f"{symbol} 数据齐全，跳过", current=idx, total=len(symbols))
                 continue
 
             # 为确保数据 100% 齐全：从最早缺失的小时开始回补（并带一点 overlap 避免边界误差）
@@ -315,7 +325,7 @@ def main() -> None:
             delete_older_than(conn, cutoff_ms, [symbol])
             conn.commit()
             wrote_any = wrote_any or inserted > 0
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] {symbol} 入库 {inserted} 条")
+            collector_log_progress("Hyperliquid", "history", detail=f"{symbol} 入库 {inserted} 条", current=idx, total=len(symbols))
 
             # 回补后再检查一次是否仍有缺口（用于提醒是否仍需等待最新数据产生）
             after = load_existing_buckets(
@@ -348,7 +358,7 @@ def main() -> None:
             suffix = "" if len(incomplete_symbols) <= 10 else f" ... total={len(incomplete_symbols)}"
             raise RuntimeError(f"Hyperliquid history 仍存在数据缺口的交易对: {preview}{suffix}")
 
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]同步完成")
+    collector_log_end("Hyperliquid", "history")
 
 
 if __name__ == "__main__":

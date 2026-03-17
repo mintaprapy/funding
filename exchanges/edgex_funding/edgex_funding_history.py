@@ -20,6 +20,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     RateLimiter,
     delete_older_than,
     ensure_history_table,
@@ -225,7 +228,7 @@ def main() -> None:
         ensure_history_table(conn, HISTORY_TABLE)
         symbols = load_symbols(conn, INFO_TABLE)
         contract_ids = fetch_contract_ids()
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]共 {len(symbols)} 个交易对，开始拉取近 {DAYS_TO_FETCH} 天资金费率")
+        collector_log_start("edgeX", "history", detail=f"{len(symbols)} 个交易对，近 {DAYS_TO_FETCH} 天资金费率")
 
         for idx, symbol in enumerate(symbols, 1):
             contract_id = contract_ids.get(symbol)
@@ -248,9 +251,9 @@ def main() -> None:
             )
             delete_older_than(conn, HISTORY_TABLE, cutoff_ms, [symbol])
             conn.commit()
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] {symbol} 入库 {inserted} 条")
+            collector_log_progress("edgeX", "history", detail=f"{symbol} 入库 {inserted} 条", current=idx, total=len(symbols))
 
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]同步完成")
+    collector_log_end("edgeX", "history")
 
 
 if __name__ == "__main__":

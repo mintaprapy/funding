@@ -18,6 +18,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     annualized_decimal_to_interval_decimal_str,
     delete_older_than,
     ensure_history_table,
@@ -56,7 +59,7 @@ def variational_get(session: requests.Session, path: str) -> dict[str, Any]:
     raise RuntimeError(f"Variational 请求失败: {path}, err={last_exc}") from last_exc
 
 
-def bucket_next_funding_time(updated_ms: int, interval_s: Any) -> int | None:
+def bucket_funding_time(updated_ms: int, interval_s: Any) -> int | None:
     try:
         interval_ms = int(float(interval_s) * 1000)
     except (TypeError, ValueError):
@@ -64,9 +67,10 @@ def bucket_next_funding_time(updated_ms: int, interval_s: Any) -> int | None:
     if interval_ms <= 0:
         return None
     # Variational does not document a public funding-history endpoint. We snapshot the
-    # currently published funding rate into the next settlement bucket so repeated runs
-    # within the same interval overwrite instead of over-counting.
-    return ((updated_ms // interval_ms) + 1) * interval_ms
+    # currently published funding rate into the current interval bucket so repeated runs
+    # within the same interval overwrite instead of over-counting, while the bucket
+    # remains queryable immediately on a fresh database.
+    return (updated_ms // interval_ms) * interval_ms
 
 
 def main() -> None:
@@ -75,6 +79,7 @@ def main() -> None:
 
     with sqlite3.connect(DB_PATH) as conn, requests.Session() as session:
         ensure_history_table(conn, HISTORY_TABLE)
+        collector_log_start("Variational", "history", detail="快照累积模式")
         stats = variational_get(session, STATS_PATH)
         listings = stats.get("listings")
         if not isinstance(listings, list):
@@ -90,7 +95,7 @@ def main() -> None:
                 continue
             quotes = item.get("quotes") if isinstance(item.get("quotes"), dict) else {}
             updated_ms = parse_iso_to_ms(str(quotes.get("updated_at") or "")) or now_ms
-            funding_time = bucket_next_funding_time(updated_ms, item.get("funding_interval_s"))
+            funding_time = bucket_funding_time(updated_ms, item.get("funding_interval_s"))
             if funding_time is None:
                 continue
             rows.append(
@@ -118,7 +123,8 @@ def main() -> None:
         )
         delete_older_than(conn, HISTORY_TABLE, cutoff_ms, touched)
         conn.commit()
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 写入 {len(rows)} 条到 {HISTORY_TABLE}（快照累积模式）")
+        collector_log_progress("Variational", "history", detail=f"写入 {len(rows)} 条到 {HISTORY_TABLE}（快照累积模式）")
+        collector_log_end("Variational", "history", detail=f"写入 {len(rows)} 条")
 
 
 if __name__ == "__main__":

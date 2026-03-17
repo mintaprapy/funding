@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -18,6 +19,15 @@ FUNDING_RATE_PATH = "/fapi/v1/fundingRate"
 REQUEST_TIMEOUT = 15
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
+)
+
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 INFO_TABLE = "aster_funding_baseinfo"
 HISTORY_TABLE = "aster_funding_history"
@@ -185,7 +195,7 @@ def main() -> None:
     with sqlite3.connect(DB_PATH) as conn, requests.Session() as session:
         ensure_history_table(conn)
         symbols = load_symbols(conn)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]共 {len(symbols)} 个交易对，开始拉取近 {DAYS_TO_FETCH} 天资金费率")
+        collector_log_start("Aster", "history", detail=f"{len(symbols)} 个交易对，近 {DAYS_TO_FETCH} 天资金费率")
 
         for idx, symbol in enumerate(symbols, 1):
             try:
@@ -202,17 +212,17 @@ def main() -> None:
                 conn.rollback()
                 continue
 
-            log_line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] {symbol} 入库 {saved_count} 条"
+            log_detail = f"{symbol} 入库 {saved_count} 条"
             if invalid_count > 0:
-                log_line += f"（跳过 fundingTime 非法 {invalid_count} 条）"
-            print(log_line)
+                log_detail += f"（跳过 fundingTime 非法 {invalid_count} 条）"
+            collector_log_progress("Aster", "history", detail=log_detail, current=idx, total=len(symbols))
 
         orphan_deleted = delete_orphan_history(conn)
         conn.commit()
         if orphan_deleted > 0:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]清理孤儿历史记录 {orphan_deleted} 条")
+            collector_log_progress("Aster", "history", detail=f"清理孤儿历史记录 {orphan_deleted} 条")
 
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]同步完成")
+    collector_log_end("Aster", "history")
 
 
 if __name__ == "__main__":

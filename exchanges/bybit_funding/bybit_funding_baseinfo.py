@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -30,6 +31,15 @@ INSURANCE_PATH = "/v5/market/insurance"
 REQUEST_TIMEOUT = 15
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
+)
+
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "bybit_funding_baseinfo"
 CATEGORY = "linear"
@@ -314,16 +324,16 @@ def main() -> None:
 
         instruments = fetch_instruments(session)
         symbols = sorted(instruments.keys())
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个 USDT Linear 交易对")
+        collector_log_start("Bybit", "base", detail=f"{len(symbols)} 个 USDT Linear 交易对")
 
         tickers = fetch_tickers(session)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 tickers（markPrice / fundingRate / openInterest）")
+        collector_log_progress("Bybit", "base", detail="获取 tickers（markPrice / fundingRate / openInterest）")
 
         insurance_by_symbol: dict[str, str] = {}
         try:
             insurance_by_symbol = fetch_insurance_by_symbol(session)
             if insurance_by_symbol:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取风险保障基金（覆盖 {len(insurance_by_symbol)} 个交易对）")
+                collector_log_progress("Bybit", "base", detail=f"获取风险保障基金（覆盖 {len(insurance_by_symbol)} 个交易对）")
         except Exception as exc:  # noqa: BLE001
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] 风险保障基金解析失败：{exc}")
 
@@ -394,12 +404,10 @@ def main() -> None:
         else:
             deleted = delete_obsolete_symbols(conn, existing - current)
             if deleted:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 删除已下架交易对 {len(deleted)} 个")
+                collector_log_progress("Bybit", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
         save_records(conn, rows)
-        print(
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条，tickers 缺失 {missing} 条"
-        )
+        collector_log_end("Bybit", "base", detail=f"入库 {len(rows)} 条，tickers 缺失 {missing} 条")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -17,6 +18,15 @@ FUNDING_HISTORY_PATH = "/v5/market/funding/history"
 REQUEST_TIMEOUT = 15
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
+)
+
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 INFO_TABLE = "bybit_funding_baseinfo"
 HISTORY_TABLE = "bybit_funding_history"
@@ -227,9 +237,7 @@ def main() -> None:
     with sqlite3.connect(DB_PATH) as conn, requests.Session() as session:
         ensure_history_table(conn)
         symbols = load_symbols(conn)
-        print(
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]共 {len(symbols)} 个交易对，开始拉取近 {DAYS_TO_FETCH} 天资金费率"
-        )
+        collector_log_start("Bybit", "history", detail=f"{len(symbols)} 个交易对，近 {DAYS_TO_FETCH} 天资金费率")
 
         for idx, symbol in enumerate(symbols, 1):
             try:
@@ -241,9 +249,9 @@ def main() -> None:
             save_history(conn, symbol, records, now_ms=end_ms)
             delete_older_than(conn, cutoff_ms, [symbol])
             conn.commit()
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] {symbol} 入库 {len(records)} 条")
+            collector_log_progress("Bybit", "history", detail=f"{symbol} 入库 {len(records)} 条", current=idx, total=len(symbols))
 
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]同步完成")
+    collector_log_end("Bybit", "history")
 
 
 if __name__ == "__main__":

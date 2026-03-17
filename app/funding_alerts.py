@@ -122,24 +122,29 @@ def fetch_h4_sums(now_ms: int) -> dict[tuple[str, str], float | None]:
     return result
 
 
+def parse_abs_threshold(config: dict[str, Any], key: str) -> float | None:
+    raw = config.get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        return abs(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertHit]:
-    latest_threshold = config.get("latest_abs_pct_gte")
-    try:
-        latest_threshold_pct = abs(float(latest_threshold)) if latest_threshold is not None else None
-    except (TypeError, ValueError):
-        latest_threshold_pct = None
-    h4_threshold = config.get("h4_abs_pct_gte")
-    try:
-        h4_threshold_pct = abs(float(h4_threshold)) if h4_threshold is not None else None
-    except (TypeError, ValueError):
-        h4_threshold_pct = None
+    latest_threshold_gte_pct = parse_abs_threshold(config, "latest_abs_pct_gte")
+    latest_threshold_lte_pct = parse_abs_threshold(config, "latest_abs_pct_lte")
+    h4_threshold_gte_pct = parse_abs_threshold(config, "h4_abs_pct_gte")
+    h4_threshold_lte_pct = parse_abs_threshold(config, "h4_abs_pct_lte")
     oi_min_musd = config.get("open_interest_min_musd")
     try:
         oi_min_musd_value = max(0.0, float(oi_min_musd)) if oi_min_musd is not None else None
     except (TypeError, ValueError):
         oi_min_musd_value = None
     generated_at = int(payload.get("generatedAt") or time.time() * 1000)
-    h4_sums = fetch_h4_sums(generated_at) if h4_threshold_pct is not None else {}
+    h4_enabled = h4_threshold_gte_pct is not None or h4_threshold_lte_pct is not None
+    h4_sums = fetch_h4_sums(generated_at) if h4_enabled else {}
 
     hits: list[AlertHit] = []
     for item in payload.get("items", []):
@@ -164,19 +169,23 @@ def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertH
 
         latest = item.get("lastFundingRate")
         latest_value = float(latest) if isinstance(latest, (int, float)) else None
-        h4_raw = h4_sums.get((exchange_key, symbol)) if h4_threshold_pct is not None else None
+        h4_raw = h4_sums.get((exchange_key, symbol)) if h4_enabled else None
         h4_value = float(h4_raw) if isinstance(h4_raw, (int, float)) else None
 
         dedupe_keys: list[str] = []
-        if latest_threshold_pct is not None and latest_value is not None:
+        if latest_value is not None:
             latest_pct = abs(latest_value * 100.0)
-            if latest_pct >= latest_threshold_pct:
-                dedupe_keys.append(f"{exchange}:{symbol}:latest")
+            if latest_threshold_gte_pct is not None and latest_pct >= latest_threshold_gte_pct:
+                dedupe_keys.append(f"{exchange}:{symbol}:latest_gte")
+            if latest_threshold_lte_pct is not None and latest_pct <= latest_threshold_lte_pct:
+                dedupe_keys.append(f"{exchange}:{symbol}:latest_lte")
 
-        if h4_threshold_pct is not None and h4_value is not None:
+        if h4_value is not None:
             h4_pct = abs(h4_value * 100.0)
-            if h4_pct >= h4_threshold_pct:
-                dedupe_keys.append(f"{exchange}:{symbol}:h4")
+            if h4_threshold_gte_pct is not None and h4_pct >= h4_threshold_gte_pct:
+                dedupe_keys.append(f"{exchange}:{symbol}:h4_gte")
+            if h4_threshold_lte_pct is not None and h4_pct <= h4_threshold_lte_pct:
+                dedupe_keys.append(f"{exchange}:{symbol}:h4_lte")
 
         if dedupe_keys:
             hits.append(

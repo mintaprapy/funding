@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -28,6 +29,15 @@ INFO_PATH = "/info"
 REQUEST_TIMEOUT = 15
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
+)
+
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "hyperliquid_funding_baseinfo"
 DEFAULT_FUNDING_INTERVAL_HOURS = 1
@@ -251,7 +261,7 @@ def main() -> None:
     now_ms = int(time.time() * 1000)
     with requests.Session() as session:
         symbols, ctx_map = fetch_meta_and_asset_ctxs(session)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（Hyperliquid）")
+        collector_log_start("Hyperliquid", "base", detail=f"{len(symbols)} 个交易对")
 
         rows: list[tuple[Any, ...]] = []
         for sym in symbols:
@@ -281,12 +291,10 @@ def main() -> None:
             save_records(conn, rows)
 
         if removed:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]删除下架交易对：{', '.join(removed)}")
+            collector_log_progress("Hyperliquid", "base", detail=f"删除下架交易对：{', '.join(removed)}")
         if added:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]新增交易对：{', '.join(added)}")
-        print(
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]更新 {len(rows)} 条记录到 {DB_PATH} 的表 {TABLE_NAME}"
-        )
+            collector_log_progress("Hyperliquid", "base", detail=f"新增交易对：{', '.join(added)}")
+        collector_log_end("Hyperliquid", "base", detail=f"更新 {len(rows)} 条记录到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

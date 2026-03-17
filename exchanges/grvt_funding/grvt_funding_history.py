@@ -17,6 +17,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     RateLimiter,
     delete_older_than,
     ensure_history_table,
@@ -151,7 +154,7 @@ def main() -> None:
         session.trust_env = False
         ensure_history_table(conn, HISTORY_TABLE)
         symbols = load_symbols(conn, INFO_TABLE)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]共 {len(symbols)} 个交易对，开始拉取近 {DAYS_TO_FETCH} 天资金费率")
+        collector_log_start("GRVT", "history", detail=f"{len(symbols)} 个交易对，近 {DAYS_TO_FETCH} 天资金费率")
 
         wrote_any = False
         failed_symbols: list[str] = []
@@ -174,7 +177,7 @@ def main() -> None:
             delete_older_than(conn, HISTORY_TABLE, cutoff_ms, [symbol])
             conn.commit()
             wrote_any = wrote_any or inserted > 0
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] {symbol} 入库 {inserted} 条")
+            collector_log_progress("GRVT", "history", detail=f"{symbol} 入库 {inserted} 条", current=idx, total=len(symbols))
 
         if not wrote_any:
             raise RuntimeError("GRVT history 未写入任何记录")
@@ -183,7 +186,7 @@ def main() -> None:
             suffix = "" if len(failed_symbols) <= 10 else f" ... total={len(failed_symbols)}"
             raise RuntimeError(f"GRVT history 存在未成功拉取的交易对: {preview}{suffix}")
 
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]同步完成")
+    collector_log_end("GRVT", "history")
 
 
 if __name__ == "__main__":

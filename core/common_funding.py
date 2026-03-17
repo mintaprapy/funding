@@ -13,6 +13,55 @@ from typing import Any, Iterable
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 15_000
 
 
+def _collector_log_message(
+    exchange_label: str,
+    kind: str,
+    stage: str,
+    *,
+    detail: str | None = None,
+    current: int | None = None,
+    total: int | None = None,
+) -> str:
+    head = f"{exchange_label} {kind} 信息获取{stage}"
+    if stage == "进度" and current is not None and total is not None:
+        head += f" [{current}/{total}]"
+    if detail:
+        if stage == "进度":
+            head += f" {detail}"
+        else:
+            head += f"（{detail}）"
+    return f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {head}"
+
+
+def collector_log_start(exchange_label: str, kind: str, *, detail: str | None = None) -> None:
+    print(_collector_log_message(exchange_label, kind, "开始", detail=detail), flush=True)
+
+
+def collector_log_progress(
+    exchange_label: str,
+    kind: str,
+    *,
+    detail: str | None = None,
+    current: int | None = None,
+    total: int | None = None,
+) -> None:
+    print(
+        _collector_log_message(
+            exchange_label,
+            kind,
+            "进度",
+            detail=detail,
+            current=current,
+            total=total,
+        ),
+        flush=True,
+    )
+
+
+def collector_log_end(exchange_label: str, kind: str, *, detail: str | None = None) -> None:
+    print(_collector_log_message(exchange_label, kind, "结束", detail=detail), flush=True)
+
+
 def tune_sqlite_connection(
     conn: sqlite3.Connection,
     *,

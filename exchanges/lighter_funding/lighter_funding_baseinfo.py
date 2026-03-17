@@ -17,17 +17,23 @@ from typing import Any
 import requests
 
 try:
-    import certifi
     import websockets
 except Exception:  # noqa: BLE001
-    certifi = None
     websockets = None
+
+try:
+    import certifi
+except Exception:  # noqa: BLE001
+    certifi = None
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     ensure_baseinfo_table,
     fetch_existing_symbols,
     delete_obsolete_symbols,
@@ -152,9 +158,13 @@ def fetch_stats_by_symbol(session: requests.Session) -> dict[str, dict[str, Any]
 
 
 async def _fetch_market_stats_via_websocket() -> dict[str, dict[str, Any]]:
-    if websockets is None or certifi is None:
-        raise RuntimeError("websockets/certifi 不可用")
-    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    if websockets is None:
+        raise RuntimeError("websockets 不可用")
+    ssl_ctx = (
+        ssl.create_default_context(cafile=certifi.where())
+        if certifi is not None
+        else ssl.create_default_context()
+    )
     async with websockets.connect(
         STREAM_URL,
         ssl=ssl_ctx,
@@ -257,7 +267,11 @@ def main() -> None:
             market_stats_by_symbol = fetch_market_stats_by_symbol()
         except Exception as exc:  # noqa: BLE001
             market_stats_by_symbol = {}
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] 获取 market_stats 失败，回退到 last_trade_price：{exc}")
+            level = "info" if "websockets 不可用" in str(exc) else "warn"
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{level}] "
+                f"获取 market_stats 失败，回退到 last_trade_price：{exc}"
+            )
         rates_by_symbol = fetch_funding_rate_by_symbol(session)
         try:
             oi_by_symbol = fetch_open_interest_by_symbol(session)
@@ -265,7 +279,7 @@ def main() -> None:
             oi_by_symbol = {}
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] 获取 open_interest 失败：{exc}")
         symbols = sorted(order_books.keys())
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（Lighter）")
+        collector_log_start("Lighter", "base", detail=f"{len(symbols)} 个交易对")
 
         rows: list[tuple[Any, ...]] = []
         for symbol in symbols:
@@ -289,10 +303,10 @@ def main() -> None:
         current = {row[0] for row in rows}
         deleted = delete_obsolete_symbols(conn, TABLE_NAME, existing - current)
         if deleted:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 删除已下架交易对 {len(deleted)} 个")
+            collector_log_progress("Lighter", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
         save_records(conn, rows)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条到 {TABLE_NAME}")
+        collector_log_end("Lighter", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

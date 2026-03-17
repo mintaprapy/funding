@@ -17,6 +17,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     RateLimiter,
     delete_obsolete_symbols,
     ensure_baseinfo_table,
@@ -142,10 +145,13 @@ def recover_failed_tickers(
         if not remaining:
             break
         sleep_s = min(15.0, TICKER_RECOVERY_SLEEP_BASE * round_idx)
-        print(
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-            f"GRVT ticker 补抓 round {round_idx}/{MAX_TICKER_RECOVERY_ROUNDS}，"
-            f"待补 {len(remaining)} 个；sleep {sleep_s:.1f}s"
+        collector_log_progress(
+            "GRVT",
+            "base",
+            detail=(
+                f"ticker 补抓 round {round_idx}/{MAX_TICKER_RECOVERY_ROUNDS}，"
+                f"待补 {len(remaining)} 个；sleep {sleep_s:.1f}s"
+            ),
         )
         time.sleep(sleep_s)
         recovered, remaining = fetch_tickers(session, remaining, limiter)
@@ -203,7 +209,7 @@ def main() -> None:
         tickers, failed_symbols = fetch_tickers(session, symbols, limiter)
         if failed_symbols:
             failed_symbols = recover_failed_tickers(session, tickers, failed_symbols, limiter)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（GRVT）")
+        collector_log_start("GRVT", "base", detail=f"{len(symbols)} 个交易对")
 
         rows: list[tuple[Any, ...]] = []
         for idx, symbol in enumerate(symbols, 1):
@@ -229,16 +235,16 @@ def main() -> None:
                 )
             )
             if idx % 30 == 0 or idx == len(symbols):
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] 处理中")
+                collector_log_progress("GRVT", "base", detail="处理中", current=idx, total=len(symbols))
 
         existing = fetch_existing_symbols(conn, TABLE_NAME)
         current = {row[0] for row in rows}
         deleted = delete_obsolete_symbols(conn, TABLE_NAME, existing - current)
         if deleted:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 删除已下架交易对 {len(deleted)} 个")
+            collector_log_progress("GRVT", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
         save_records(conn, rows)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条到 {TABLE_NAME}")
+        collector_log_end("GRVT", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
         if failed_symbols:
             preview = ",".join(failed_symbols[:10])
             suffix = "" if len(failed_symbols) <= 10 else f" ... total={len(failed_symbols)}"

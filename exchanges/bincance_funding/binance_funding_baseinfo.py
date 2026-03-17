@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
@@ -30,6 +31,15 @@ MAX_HTTP_RETRIES = 6
 RETRY_BASE_SLEEP = 1.0
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
+)
+
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "binance_funding_baseinfo"
 
@@ -242,20 +252,20 @@ def main() -> None:
     with requests.Session() as session:
         session.trust_env = False
         symbols = get_trading_usdt_perpetual_symbols(session=session)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对")
+        collector_log_start("Binance", "base", detail=f"{len(symbols)} 个交易对")
 
         funding_info = get_funding_info(session=session)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取资金费上下限、结算周期")
+        collector_log_progress("Binance", "base", detail="获取资金费上下限、结算周期")
 
         premium_index = get_premium_index(session=session)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取标记价格、最新资金费率")
+        collector_log_progress("Binance", "base", detail="获取标记价格、最新资金费率")
 
         open_interest = get_open_interest(symbols)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取获取未平仓合约数")
+        collector_log_progress("Binance", "base", detail="获取未平仓合约数")
 
         try:
             insurance_items = get_insurance_balance(session=session)
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取保险基金余额（{len(insurance_items)} 条）")
+            collector_log_progress("Binance", "base", detail=f"获取保险基金余额（{len(insurance_items)} 条）")
         except Exception as exc:  # noqa: BLE001
             insurance_items = []
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] 保险基金余额获取失败：{exc}")
@@ -364,12 +374,12 @@ def main() -> None:
         save_records(conn, rows)
 
     if removed:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]删除下架交易对：{', '.join(removed)}")
+        collector_log_progress("Binance", "base", detail=f"删除下架交易对：{', '.join(removed)}")
     if added:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]新增交易对：{', '.join(added)}")
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]更新 {len(rows)} 条记录到 {DB_PATH} 的表 {TABLE_NAME}")
+        collector_log_progress("Binance", "base", detail=f"新增交易对：{', '.join(added)}")
     if insurance_items:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]已将保险基金余额写入每个交易对记录（insuranceBalance）")
+        collector_log_progress("Binance", "base", detail="已将保险基金余额写入每个交易对记录（insuranceBalance）")
+    collector_log_end("Binance", "base", detail=f"更新 {len(rows)} 条记录到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

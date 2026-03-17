@@ -20,6 +20,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     RateLimiter,
     delete_obsolete_symbols,
     ensure_baseinfo_table,
@@ -179,7 +182,7 @@ def main() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         ensure_baseinfo_table(conn, TABLE_NAME)
         contracts = fetch_contracts()
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(contracts)} 个交易对（edgeX）")
+        collector_log_start("edgeX", "base", detail=f"{len(contracts)} 个交易对")
 
         rows: list[tuple[Any, ...]] = []
         missing = 0
@@ -218,7 +221,7 @@ def main() -> None:
                 )
             )
             if idx % 50 == 0:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(contracts)}] 已获取")
+                collector_log_progress("edgeX", "base", detail="已获取", current=idx, total=len(contracts))
 
         if not rows:
             raise RuntimeError("未获取到任何可写入的 edgeX 交易对记录")
@@ -230,10 +233,10 @@ def main() -> None:
         else:
             deleted = delete_obsolete_symbols(conn, TABLE_NAME, existing - current)
             if deleted:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 删除已下架交易对 {len(deleted)} 个")
+                collector_log_progress("edgeX", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
         save_records(conn, rows)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条到 {TABLE_NAME}")
+        collector_log_end("edgeX", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

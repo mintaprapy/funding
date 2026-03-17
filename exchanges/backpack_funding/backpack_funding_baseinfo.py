@@ -17,6 +17,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     RateLimiter,
     bps_to_decimal_str,
     delete_obsolete_symbols,
@@ -132,7 +135,7 @@ def main() -> None:
 
         markets = fetch_perp_markets(session)
         symbols = sorted(markets.keys())
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（Backpack）")
+        collector_log_start("Backpack", "base", detail=f"{len(symbols)} 个交易对")
 
         rows: list[tuple[Any, ...]] = []
         for idx, symbol in enumerate(symbols, 1):
@@ -180,16 +183,16 @@ def main() -> None:
                 )
             )
             if idx % 20 == 0 or idx == len(symbols):
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{idx}/{len(symbols)}] 处理中")
+                collector_log_progress("Backpack", "base", detail="处理中", current=idx, total=len(symbols))
 
         existing = fetch_existing_symbols(conn, TABLE_NAME)
         current = {row[0] for row in rows}
         deleted = delete_obsolete_symbols(conn, TABLE_NAME, existing - current)
         if deleted:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 删除已下架交易对 {len(deleted)} 个")
+            collector_log_progress("Backpack", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
         save_records(conn, rows)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条到 {TABLE_NAME}")
+        collector_log_end("Backpack", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

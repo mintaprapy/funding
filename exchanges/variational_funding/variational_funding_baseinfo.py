@@ -19,6 +19,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     annualized_decimal_to_interval_decimal_str,
     delete_obsolete_symbols,
     ensure_baseinfo_table,
@@ -102,6 +105,7 @@ def main() -> None:
     now_ms = int(time.time() * 1000)
     with requests.Session() as session, sqlite3.connect(DB_PATH) as conn:
         ensure_baseinfo_table(conn, TABLE_NAME)
+        collector_log_start("Variational", "base")
         stats = variational_get(session, STATS_PATH)
         listings = stats.get("listings")
         if not isinstance(listings, list):
@@ -146,10 +150,10 @@ def main() -> None:
         current = {row[0] for row in rows}
         deleted = delete_obsolete_symbols(conn, TABLE_NAME, existing - current)
         if deleted:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 删除已下架交易对 {len(deleted)} 个")
+            collector_log_progress("Variational", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
         save_records(conn, rows)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条到 {TABLE_NAME}")
+        collector_log_end("Variational", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

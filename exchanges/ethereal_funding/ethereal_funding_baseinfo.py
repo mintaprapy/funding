@@ -18,6 +18,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
     delete_obsolete_symbols,
     ensure_baseinfo_table,
     fetch_existing_symbols,
@@ -163,11 +166,11 @@ def main() -> None:
         session.trust_env = False
         ensure_baseinfo_table(conn, TABLE_NAME)
         base_url = resolve_base_url(session)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 使用 Ethereal API: {base_url}")
+        collector_log_start("Ethereal", "base", detail=f"使用 API {base_url}")
 
         products = fetch_products(session, base_url)
         prices = fetch_market_prices(session, base_url, list(products.keys()))
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(products)} 个交易对（Ethereal）")
+        collector_log_progress("Ethereal", "base", detail=f"获取 {len(products)} 个交易对")
 
         rows: list[tuple[Any, ...]] = []
         for pid, product in sorted(products.items(), key=lambda x: str(x[1].get("ticker") or "")):
@@ -197,10 +200,10 @@ def main() -> None:
         current = {row[0] for row in rows}
         deleted = delete_obsolete_symbols(conn, TABLE_NAME, existing - current)
         if deleted:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 删除已下架交易对 {len(deleted)} 个")
+            collector_log_progress("Ethereal", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
         save_records(conn, rows)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 入库 {len(rows)} 条到 {TABLE_NAME}")
+        collector_log_end("Ethereal", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -37,6 +38,15 @@ INSURANCE_BALANCE_PATH = "/fapi/v1/insuranceBalance"
 REQUEST_TIMEOUT = 15
 
 ROOT_DIR = next(parent for parent in Path(__file__).resolve().parents if (parent / "start_all_funding.sh").exists())
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.common_funding import (
+    collector_log_end,
+    collector_log_progress,
+    collector_log_start,
+)
+
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 TABLE_NAME = "aster_funding_baseinfo"
 
@@ -234,23 +244,23 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
 
 def main() -> None:
     symbols = get_trading_usdt_perpetual_symbols()
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {len(symbols)} 个交易对（Aster）")
+    collector_log_start("Aster", "base", detail=f"{len(symbols)} 个交易对")
 
     funding_info = get_funding_info()
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取资金费上下限、结算周期")
+    collector_log_progress("Aster", "base", detail="获取资金费上下限、结算周期")
 
     premium_index = get_premium_index()
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取标记价格、最新资金费率")
+    collector_log_progress("Aster", "base", detail="获取标记价格、最新资金费率")
 
     open_interest = get_open_interest(symbols)
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取未平仓合约数")
+    collector_log_progress("Aster", "base", detail="获取未平仓合约数")
 
     try:
         insurance_items = get_insurance_balance()
         if insurance_items:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取风险保障基金（{len(insurance_items)} 条）")
+            collector_log_progress("Aster", "base", detail=f"获取风险保障基金（{len(insurance_items)} 条）")
         else:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 风险保障基金接口未提供或无数据，已跳过")
+            collector_log_progress("Aster", "base", detail="风险保障基金接口未提供或无数据，已跳过")
     except Exception as exc:  # noqa: BLE001
         insurance_items = []
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] 风险保障基金获取失败：{exc}")
@@ -327,10 +337,10 @@ def main() -> None:
         save_records(conn, rows)
 
     if removed:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]删除下架交易对：{', '.join(removed)}")
+        collector_log_progress("Aster", "base", detail=f"删除下架交易对：{', '.join(removed)}")
     if added:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]新增交易对：{', '.join(added)}")
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]更新 {len(rows)} 条记录到 {DB_PATH} 的表 {TABLE_NAME}")
+        collector_log_progress("Aster", "base", detail=f"新增交易对：{', '.join(added)}")
+    collector_log_end("Aster", "base", detail=f"更新 {len(rows)} 条记录到 {TABLE_NAME}")
 
 
 if __name__ == "__main__":

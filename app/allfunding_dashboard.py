@@ -108,6 +108,40 @@ def _mark_migration_applied(conn: sqlite3.Connection, key: str) -> None:
     conn.commit()
 
 
+def _to_int(val: Any) -> int | None:
+    try:
+        if val is None:
+            return None
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_exchange_baseinfo_completed_at(conn: sqlite3.Connection) -> dict[str, int]:
+    if not _table_exists(conn, APP_META_TABLE):
+        return {}
+    cur = conn.execute(
+        f"""
+        SELECT key, value, updated_at
+        FROM {APP_META_TABLE}
+        WHERE key LIKE 'exchange_baseinfo_completed_at:%'
+        ORDER BY key
+        """
+    )
+    out: dict[str, int] = {}
+    for row in cur.fetchall():
+        key = str(row["key"] or "")
+        _, _, exchange = key.partition(":")
+        if not exchange:
+            continue
+        ts = _to_int(row["value"])
+        if ts is None:
+            ts = _to_int(row["updated_at"])
+        if ts is not None:
+            out[exchange] = ts
+    return out
+
+
 def _normalize_legacy_bps_columns(
     conn: sqlite3.Connection,
     table: str,
@@ -570,8 +604,12 @@ def fetch_base_info(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]
 
 
 def fetch_cumulative_rates(
-    conn: sqlite3.Connection, *, history_table: str, now_ms: int
-) -> dict[str, dict[str, float | None]]:
+    conn: sqlite3.Connection,
+    *,
+    history_table: str,
+    now_ms: int,
+    allow_partial: bool = False,
+) -> dict[str, dict[str, Any]]:
     params: list[int] = []
     case_parts = [
         f"COALESCE(SUM(CASE WHEN fundingTime >= ? AND fundingTime <= ? THEN CAST(fundingRate AS REAL) ELSE 0 END), 0) AS {key}"
@@ -588,15 +626,25 @@ def fetch_cumulative_rates(
         GROUP BY symbol
     """
     cur = conn.execute(sql, [*params, now_ms])
-    result: dict[str, dict[str, float | None]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for row in cur.fetchall():
         oldest = row["oldestFundingTime"]
         oldest_ms = int(oldest) if oldest is not None else None
         sums: dict[str, float | None] = {}
+        partial: dict[str, bool] = {}
+        coverage_ms: dict[str, int | None] = {}
         for key, span, _ in WINDOWS:
             mature = oldest_ms is not None and oldest_ms <= now_ms - span
-            sums[key] = float(row[key]) if mature else None
-        result[row["symbol"]] = sums
+            observed_ms = None if oldest_ms is None else max(0, now_ms - oldest_ms)
+            use_partial = bool(allow_partial and oldest_ms is not None and not mature)
+            sums[key] = float(row[key]) if (mature or use_partial) else None
+            partial[key] = use_partial
+            coverage_ms[key] = span if mature else observed_ms
+        result[row["symbol"]] = {
+            "values": sums,
+            "partial": partial,
+            "coverageMs": coverage_ms,
+        }
     return result
 
 
@@ -605,6 +653,8 @@ def _build_payload_uncached() -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     with connect_db() as conn:
         prepare_schema(conn)
+        exchange_updated_at = fetch_exchange_baseinfo_completed_at(conn)
+        fallback_exchange_updated_at: dict[str, int] = {}
         for exchange, meta in EXCHANGES.items():
             info_table = _INFO_TABLE_BY_EXCHANGE.get(exchange)
             if info_table is None:
@@ -612,11 +662,21 @@ def _build_payload_uncached() -> dict[str, Any]:
                 _INFO_TABLE_BY_EXCHANGE[exchange] = info_table
             history_table = str(meta["history_table"])
             base_rows = fetch_base_info(conn, info_table)
-            sums_by_symbol = fetch_cumulative_rates(conn, history_table=history_table, now_ms=now_ms)
+            sums_by_symbol = fetch_cumulative_rates(
+                conn,
+                history_table=history_table,
+                now_ms=now_ms,
+                allow_partial=bool(meta.get("allow_partial_window_sums")),
+            )
             default_sums = {key: None for key, _, _ in WINDOWS}
+            default_partial = {key: False for key, _, _ in WINDOWS}
+            default_coverage = {key: None for key, _, _ in WINDOWS}
 
             for row in base_rows:
-                sums = sums_by_symbol.get(row["symbol"], default_sums)
+                sum_bundle = sums_by_symbol.get(
+                    row["symbol"],
+                    {"values": default_sums, "partial": default_partial, "coverageMs": default_coverage},
+                )
                 oi = row.get("openInterest")
                 mp = row.get("markPrice")
                 if bool(meta["open_interest_is_notional"]):
@@ -632,14 +692,24 @@ def _build_payload_uncached() -> dict[str, Any]:
                         "exchange": exchange,
                         "exchangeLabel": str(meta["label"]),
                         "openInterestNotional": notional,
-                        "sums": sums,
+                        "sums": dict(sum_bundle["values"]),
+                        "sumsPartial": dict(sum_bundle["partial"]),
+                        "sumsCoverageMs": dict(sum_bundle["coverageMs"]),
                     }
                 )
+                if row.get("updated_at") is not None:
+                    fallback_exchange_updated_at[exchange] = max(
+                        fallback_exchange_updated_at.get(exchange, 0),
+                        int(row["updated_at"]),
+                    )
+        for exchange, ts in fallback_exchange_updated_at.items():
+            exchange_updated_at.setdefault(exchange, ts)
 
     return {
         "generatedAt": now_ms,
         "windows": [{"key": key, "label": label, "spanMs": span} for key, span, label in WINDOWS],
         "exchanges": [{"key": k, "label": str(v["label"])} for k, v in EXCHANGES.items()],
+        "exchangeUpdatedAt": exchange_updated_at,
         "items": items,
     }
 
@@ -1252,11 +1322,15 @@ def _render_html(*, static_payload_json: str) -> str:
     function updateMeta(payload) {{
       const footer = document.getElementById('footerText');
       const counts = {{}};
-      const updatedMap = {{}};
+      const updatedMap = {{ ...(payload.exchangeUpdatedAt || {{}}) }};
       dataCache.forEach(it => counts[it.exchange] = (counts[it.exchange] || 0) + 1);
       dataCache.forEach(it => {{
         if (it.updated_at == null) return;
-        updatedMap[it.exchange] = Math.max(updatedMap[it.exchange] || 0, Number(it.updated_at));
+        if (updatedMap[it.exchange] == null) {{
+          updatedMap[it.exchange] = Number(it.updated_at);
+        }} else if (!(payload.exchangeUpdatedAt && Object.prototype.hasOwnProperty.call(payload.exchangeUpdatedAt, it.exchange))) {{
+          updatedMap[it.exchange] = Math.max(updatedMap[it.exchange], Number(it.updated_at));
+        }}
       }});
       exchangeCounts = counts;
       exchangeUpdatedAt = updatedMap;
@@ -1289,11 +1363,19 @@ def _render_html(*, static_payload_json: str) -> str:
 
     function renderRow(item) {{
       const sums = item.sums || {{}};
+      const sumsPartial = item.sumsPartial || {{}};
+      const sumsCoverageMs = item.sumsCoverageMs || {{}};
       const windowCells = WINDOW_KEYS.map(key => {{
         const v = sums[key];
-        const days = WINDOW_DAYS_BY_KEY[key] || null;
-        const ann = days && v != null ? (v / days) * 365 : null;
-        return `<td class="num"><div class="stack"><span class="${'{'}classFor(v){'}'}">${'{'}toPct(v){'}'}</span><span class="mini ${'{'}classFor(ann){'}'}">APR ${'{'}toPctFixed(ann, 2){'}'}</span></div></td>`;
+        const partial = !!sumsPartial[key];
+        const coverageMs = sumsCoverageMs[key];
+        const observedDays = coverageMs == null ? null : coverageMs / 86_400_000;
+        const fallbackDays = WINDOW_DAYS_BY_KEY[key] || null;
+        const annDays = observedDays && observedDays > 0 ? observedDays : fallbackDays;
+        const ann = annDays && v != null ? (v / annDays) * 365 : null;
+        const valueText = partial && v != null ? `~${'{'}toPct(v){'}'}` : toPct(v);
+        const aprText = partial && ann != null ? `APR ${'{'}toPctFixed(ann, 2){'}'} · 已观测` : `APR ${'{'}toPctFixed(ann, 2){'}'}`;
+        return `<td class="num"><div class="stack"><span class="${'{'}classFor(v){'}'}">${'{'}valueText{'}'}</span><span class="mini ${'{'}classFor(ann){'}'}">${'{'}aprText{'}'}</span></div></td>`;
       }}).join('');
       const notionalDisplay = item.openInterestNotional == null ? null : item.openInterestNotional / 1_000_000;
       const insuranceDisplay = item.insuranceBalance == null ? null : item.insuranceBalance / 1_000_000;

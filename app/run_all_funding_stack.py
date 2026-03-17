@@ -38,6 +38,7 @@ DEFAULT_ALERT_CONFIG = ROOT / "config" / "alerts.json"
 BASEINFO_FRAGILE_EXCHANGES = frozenset({"grvt", "standx"})
 HISTORY_FRAGILE_EXCHANGES = frozenset({"grvt", "edgex"})
 HISTORY_DEDICATED_LANES = {"binance": "binance"}
+APP_META_TABLE = "app_meta"
 
 @dataclass
 class Job:
@@ -51,6 +52,7 @@ class Job:
 class BatchTask:
     script: Path
     exchange_key: str
+    exchange_label: str
     lane: str
     order: int
 
@@ -171,23 +173,46 @@ def build_batch_tasks(
     batch_name: str,
     scripts: list[Path],
     script_exchange_keys: dict[Path, str] | None,
+    script_exchange_labels: dict[Path, str] | None,
 ) -> list[BatchTask]:
     tasks: list[BatchTask] = []
     for index, script in enumerate(scripts):
+        resolved = script.resolve()
         exchange_key = (
-            script_exchange_keys.get(script.resolve(), script.parent.name)
+            script_exchange_keys.get(resolved, script.parent.name)
             if script_exchange_keys is not None
             else script.parent.name
+        )
+        exchange_label = (
+            script_exchange_labels.get(resolved, exchange_key)
+            if script_exchange_labels is not None
+            else exchange_key
         )
         tasks.append(
             BatchTask(
                 script=script,
                 exchange_key=exchange_key,
+                exchange_label=exchange_label,
                 lane=task_lane(batch_name, exchange_key),
                 order=index,
             )
         )
     return tasks
+
+
+def batch_kind_label(batch_name: str) -> str:
+    if batch_name.startswith("baseinfo"):
+        return "base"
+    if batch_name.startswith("history"):
+        return "history"
+    if batch_name.startswith("alerts"):
+        return ""
+    return batch_name
+
+
+def task_log_label(batch_name: str, task: BatchTask) -> str:
+    kind = batch_kind_label(batch_name)
+    return f"{task.exchange_label} {kind}".strip()
 
 
 def stop_subprocess(proc: subprocess.Popen[str], *, grace_seconds: float = 3.0) -> None:
@@ -248,11 +273,13 @@ def run_batch(
     python_bin: str,
     scripts: list[Path],
     *,
+    db_path: Path | None = None,
     should_stop: Callable[[], bool] | None = None,
     max_attempts: int = 1,
     retry_wait_s: float = 3.0,
     script_timeout_s: float = 1800.0,
     script_exchange_keys: dict[Path, str] | None = None,
+    script_exchange_labels: dict[Path, str] | None = None,
     baseinfo_general_workers: int = 4,
     history_general_workers: int = 2,
     fragile_workers: int = 1,
@@ -272,7 +299,7 @@ def run_batch(
     )
     pending: list[PendingTask] = [
         PendingTask(task=task, attempt=1)
-        for task in build_batch_tasks(name, scripts, script_exchange_keys)
+        for task in build_batch_tasks(name, scripts, script_exchange_keys, script_exchange_labels)
     ]
     running: list[RunningTask] = []
     stop_logged = False
@@ -303,15 +330,29 @@ def run_batch(
             made_progress = True
             cost = time.monotonic() - job.started_at
             timeout_note = f" (timeout {timeout_val:g}s)" if timed_out and timeout_val else ""
+            task_label = task_log_label(name, job.pending.task)
             if code == 0:
                 ok += 1
-                log(f"[{now_str()}] done {job.pending.task.script.name} in {cost:.1f}s")
+                if db_path is not None and name.startswith("baseinfo"):
+                    try:
+                        record_exchange_baseinfo_completed_at(
+                            db_path,
+                            job.pending.task.exchange_key,
+                            int(time.time() * 1000),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[{now_str()}] [warn] failed to record baseinfo completion for "
+                            f"{job.pending.task.exchange_key}: {exc}"
+                        )
+                log(f"[{now_str()}] {task_label} 信息获取结束 ({cost:.1f}s)")
                 continue
 
             if not stop_requested and job.pending.attempt < max_attempts:
                 wait_s = max(0.5, retry_wait_s * job.pending.attempt)
                 log(
-                    f"[{now_str()}] [warn] {job.pending.task.script.name} exited with code {code} after {cost:.1f}s"
+                    f"[{now_str()}] [warn] {task_label} 信息获取失败，"
+                    f"exit code {code}，耗时 {cost:.1f}s"
                     f"{timeout_note}; retry in {wait_s:.1f}s"
                 )
                 pending.append(
@@ -323,7 +364,10 @@ def run_batch(
                 )
                 continue
 
-            log(f"[{now_str()}] [warn] {job.pending.task.script.name} exited with code {code} after {cost:.1f}s{timeout_note}")
+            log(
+                f"[{now_str()}] [warn] {task_label} 信息获取失败，"
+                f"exit code {code}，耗时 {cost:.1f}s{timeout_note}"
+            )
 
         if stop_requested:
             if running:
@@ -354,7 +398,7 @@ def run_batch(
 
             cmd = [python_bin, str(item.task.script)]
             suffix = f" (attempt {item.attempt}/{max_attempts}, lane={item.task.lane})" if max_attempts > 1 else f" (lane={item.task.lane})"
-            log(f"[{now_str()}] run {item.task.script.relative_to(ROOT)}{suffix}")
+            log(f"[{now_str()}] {task_log_label(name, item.task)} 信息获取开始{suffix}")
             proc = subprocess.Popen(
                 cmd,
                 cwd=ROOT,
@@ -420,6 +464,36 @@ def release_instance_lock(fp: TextIO | None) -> None:
 def prepare_sqlite_runtime(db_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         tune_sqlite_connection(conn)
+        conn.commit()
+
+
+def _ensure_app_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {APP_META_TABLE} (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at INTEGER
+        )
+        """
+    )
+
+
+def record_exchange_baseinfo_completed_at(db_path: Path, exchange_key: str, completed_at_ms: int) -> None:
+    with sqlite3.connect(db_path) as conn:
+        tune_sqlite_connection(conn)
+        _ensure_app_meta_table(conn)
+        key = f"exchange_baseinfo_completed_at:{exchange_key}"
+        conn.execute(
+            f"""
+            INSERT INTO {APP_META_TABLE} (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (key, str(completed_at_ms), completed_at_ms),
+        )
         conn.commit()
 
 
@@ -522,11 +596,17 @@ def main() -> None:
     baseinfo_scripts = baseinfo_script_paths(ROOT, exchange_config_path)
     history_scripts = history_script_paths(ROOT, exchange_config_path)
     script_exchange_keys: dict[Path, str] = {}
+    script_exchange_labels: dict[Path, str] = {}
     for item in selected_exchanges:
-        script_exchange_keys[(ROOT / item.folder / item.baseinfo_script).resolve()] = item.key
-        script_exchange_keys[(ROOT / item.folder / item.history_script).resolve()] = item.key
+        base_script = (ROOT / item.folder / item.baseinfo_script).resolve()
+        history_script = (ROOT / item.folder / item.history_script).resolve()
+        script_exchange_keys[base_script] = item.key
+        script_exchange_keys[history_script] = item.key
+        script_exchange_labels[base_script] = item.label
+        script_exchange_labels[history_script] = item.label
     alert_script = (ROOT / "app" / "funding_alerts.py").resolve()
     script_exchange_keys[alert_script] = "__alerts__"
+    script_exchange_labels[alert_script] = "告警任务"
 
     stop_requested = False
 
@@ -592,6 +672,7 @@ def main() -> None:
                 retry_wait_s=args.script_retry_wait,
                 script_timeout_s=args.script_timeout_seconds,
                 script_exchange_keys=script_exchange_keys,
+                script_exchange_labels=script_exchange_labels,
                 baseinfo_general_workers=args.baseinfo_general_workers,
                 history_general_workers=args.history_general_workers,
                 fragile_workers=args.fragile_workers,
@@ -607,6 +688,7 @@ def main() -> None:
                 retry_wait_s=args.script_retry_wait,
                 script_timeout_s=args.script_timeout_seconds,
                 script_exchange_keys=script_exchange_keys,
+                script_exchange_labels=script_exchange_labels,
                 baseinfo_general_workers=args.baseinfo_general_workers,
                 history_general_workers=args.history_general_workers,
                 fragile_workers=args.fragile_workers,
@@ -623,6 +705,7 @@ def main() -> None:
                     retry_wait_s=args.script_retry_wait,
                     script_timeout_s=30.0,
                     script_exchange_keys=script_exchange_keys,
+                    script_exchange_labels=script_exchange_labels,
                     baseinfo_general_workers=args.baseinfo_general_workers,
                     history_general_workers=args.history_general_workers,
                     fragile_workers=args.fragile_workers,
@@ -663,6 +746,7 @@ def main() -> None:
                         retry_wait_s=args.script_retry_wait,
                         script_timeout_s=args.script_timeout_seconds,
                         script_exchange_keys=script_exchange_keys,
+                        script_exchange_labels=script_exchange_labels,
                         baseinfo_general_workers=args.baseinfo_general_workers,
                         history_general_workers=args.history_general_workers,
                         fragile_workers=args.fragile_workers,
