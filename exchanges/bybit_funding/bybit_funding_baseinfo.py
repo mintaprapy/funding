@@ -38,6 +38,7 @@ from core.common_funding import (
     collector_log_end,
     collector_log_progress,
     collector_log_start,
+    stamp_rows_updated_at,
 )
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
@@ -406,6 +407,7 @@ def main() -> None:
             if deleted:
                 collector_log_progress("Bybit", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
+        rows = stamp_rows_updated_at(rows)
         save_records(conn, rows)
         collector_log_end("Bybit", "base", detail=f"入库 {len(rows)} 条，tickers 缺失 {missing} 条")
 

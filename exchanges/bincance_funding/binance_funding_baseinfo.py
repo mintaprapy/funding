@@ -38,6 +38,7 @@ from core.common_funding import (
     collector_log_end,
     collector_log_progress,
     collector_log_start,
+    stamp_rows_updated_at,
 )
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
@@ -371,6 +372,7 @@ def main() -> None:
 
         added = sorted(current_symbols - existing_symbols)
 
+        rows = stamp_rows_updated_at(rows)
         save_records(conn, rows)
 
     if removed:

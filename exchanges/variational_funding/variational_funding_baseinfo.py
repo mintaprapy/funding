@@ -26,6 +26,7 @@ from core.common_funding import (
     delete_obsolete_symbols,
     ensure_baseinfo_table,
     fetch_existing_symbols,
+    stamp_rows_updated_at,
     to_plain_str,
 )
 
@@ -152,6 +153,7 @@ def main() -> None:
         if deleted:
             collector_log_progress("Variational", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
+        rows = stamp_rows_updated_at(rows)
         save_records(conn, rows)
         collector_log_end("Variational", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
 

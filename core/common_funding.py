@@ -219,6 +219,16 @@ def parse_iso_to_ms(ts: str) -> int | None:
     return int(dt.timestamp() * 1000)
 
 
+def stamp_rows_updated_at(
+    rows: list[tuple[Any, ...]],
+    *,
+    updated_at_ms: int | None = None,
+) -> list[tuple[Any, ...]]:
+    """Overwrite the trailing updated_at field with a single batch completion timestamp."""
+    completed_at_ms = int(updated_at_ms if updated_at_ms is not None else time.time() * 1000)
+    return [(*row[:-1], completed_at_ms) for row in rows]
+
+
 class RateLimiter:
     """Simple weighted sliding-window limiter."""
 

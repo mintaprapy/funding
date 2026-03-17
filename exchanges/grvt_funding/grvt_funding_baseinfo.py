@@ -25,6 +25,7 @@ from core.common_funding import (
     ensure_baseinfo_table,
     fetch_existing_symbols,
     pct_to_decimal_str,
+    stamp_rows_updated_at,
     to_plain_str,
 )
 
@@ -243,6 +244,7 @@ def main() -> None:
         if deleted:
             collector_log_progress("GRVT", "base", detail=f"删除已下架交易对 {len(deleted)} 个")
 
+        rows = stamp_rows_updated_at(rows)
         save_records(conn, rows)
         collector_log_end("GRVT", "base", detail=f"入库 {len(rows)} 条到 {TABLE_NAME}")
         if failed_symbols:
