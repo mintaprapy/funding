@@ -122,21 +122,23 @@ def fetch_h4_sums(now_ms: int) -> dict[tuple[str, str], float | None]:
     return result
 
 
-def parse_abs_threshold(config: dict[str, Any], key: str) -> float | None:
-    raw = config.get(key)
-    if raw in (None, ""):
-        return None
-    try:
-        return abs(float(raw))
-    except (TypeError, ValueError):
-        return None
+def parse_threshold(config: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        raw = config.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertHit]:
-    latest_threshold_gte_pct = parse_abs_threshold(config, "latest_abs_pct_gte")
-    latest_threshold_lte_pct = parse_abs_threshold(config, "latest_abs_pct_lte")
-    h4_threshold_gte_pct = parse_abs_threshold(config, "h4_abs_pct_gte")
-    h4_threshold_lte_pct = parse_abs_threshold(config, "h4_abs_pct_lte")
+    latest_threshold_gte_pct = parse_threshold(config, "latest_pct_gte", "latest_abs_pct_gte")
+    latest_threshold_lte_pct = parse_threshold(config, "latest_pct_lte", "latest_abs_pct_lte")
+    h4_threshold_gte_pct = parse_threshold(config, "h4_pct_gte", "h4_abs_pct_gte")
+    h4_threshold_lte_pct = parse_threshold(config, "h4_pct_lte", "h4_abs_pct_lte")
     oi_min_musd = config.get("open_interest_min_musd")
     try:
         oi_min_musd_value = max(0.0, float(oi_min_musd)) if oi_min_musd is not None else None
@@ -174,14 +176,14 @@ def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertH
 
         dedupe_keys: list[str] = []
         if latest_value is not None:
-            latest_pct = abs(latest_value * 100.0)
+            latest_pct = latest_value * 100.0
             if latest_threshold_gte_pct is not None and latest_pct >= latest_threshold_gte_pct:
                 dedupe_keys.append(f"{exchange}:{symbol}:latest_gte")
             if latest_threshold_lte_pct is not None and latest_pct <= latest_threshold_lte_pct:
                 dedupe_keys.append(f"{exchange}:{symbol}:latest_lte")
 
         if h4_value is not None:
-            h4_pct = abs(h4_value * 100.0)
+            h4_pct = h4_value * 100.0
             if h4_threshold_gte_pct is not None and h4_pct >= h4_threshold_gte_pct:
                 dedupe_keys.append(f"{exchange}:{symbol}:h4_gte")
             if h4_threshold_lte_pct is not None and h4_pct <= h4_threshold_lte_pct:

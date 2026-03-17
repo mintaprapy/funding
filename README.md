@@ -317,10 +317,10 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
   "cooldown_minutes": 120,
   "max_items_per_run": 20,
   "open_interest_min_musd": 3,
-  "latest_abs_pct_gte": 0.5,
-  "latest_abs_pct_lte": null,
-  "h4_abs_pct_gte": 1.0,
-  "h4_abs_pct_lte": null,
+  "latest_pct_gte": 0.5,
+  "latest_pct_lte": null,
+  "h4_pct_gte": 1.0,
+  "h4_pct_lte": null,
   "providers": {
     "telegram": {
       "enabled": true,
@@ -340,10 +340,11 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 
 规则说明：
 - `open_interest_min_musd`：持仓量最小值，单位是 `M$`；只有持仓量大于等于这个值的交易对，才会参与告警判断
-- `latest_abs_pct_gte`：最新单次资金费率绝对值大于等于这个百分比时告警；留空或 `null` 表示不启用
-- `latest_abs_pct_lte`：最新单次资金费率绝对值小于等于这个百分比时告警；留空或 `null` 表示不启用
-- `h4_abs_pct_gte`：过去 4 小时累计资金费率绝对值大于等于这个百分比时告警；留空或 `null` 表示不启用
-- `h4_abs_pct_lte`：过去 4 小时累计资金费率绝对值小于等于这个百分比时告警；留空或 `null` 表示不启用
+- `latest_pct_gte`：最新单次资金费率大于等于这个百分比时告警；留空或 `null` 表示不启用
+- `latest_pct_lte`：最新单次资金费率小于等于这个百分比时告警；留空或 `null` 表示不启用
+- `h4_pct_gte`：过去 4 小时累计资金费率大于等于这个百分比时告警；留空或 `null` 表示不启用
+- `h4_pct_lte`：过去 4 小时累计资金费率小于等于这个百分比时告警；留空或 `null` 表示不启用
+- 兼容旧字段名：`latest_abs_pct_*` / `h4_abs_pct_*` 仍可继续使用，但现在也按带符号阈值判断；例如只想监控负值，请把 `*_lte` 配成负数，如 `-0.1`
 - `cooldown_minutes`：同一条告警在冷却时间内不会重复发送
 - `max_items_per_run`：单次通知最多展开多少条命中项
 

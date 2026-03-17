@@ -3,10 +3,10 @@
   "cooldown_minutes": 15,
   "max_items_per_run": 30,
   "open_interest_min_musd": 3,
-  "latest_abs_pct_gte": 0.1,
-  "latest_abs_pct_lte": null,
-  "h4_abs_pct_gte": 0.2,
-  "h4_abs_pct_lte": null,
+  "latest_pct_gte": 0.1,
+  "latest_pct_lte": null,
+  "h4_pct_gte": 0.2,
+  "h4_pct_lte": null,
   "providers": {
     "telegram": {
       "enabled": false,
