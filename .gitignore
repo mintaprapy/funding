@@ -13,5 +13,6 @@ config/alerts.json
 .run_all_funding_stack.lock
 funding_dashboard_static.html
 logs/
+exports/
 
 .DS_Store

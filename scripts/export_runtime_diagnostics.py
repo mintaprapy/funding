@@ -32,7 +32,7 @@ from core.funding_exchanges import ExchangeDef, enabled_exchanges
 
 DEFAULT_SERVICE = "funding-stack"
 DEFAULT_HOURS = 12
-DEFAULT_OUTPUT_ROOT = Path("/tmp")
+DEFAULT_OUTPUT_ROOT = ROOT / "exports"
 DEFAULT_API_URL = "http://127.0.0.1:5000/api/data"
 DEFAULT_DB_PATH = ROOT / "funding.db"
 WINDOW_KEYS = ("h24", "d3", "d7", "d15", "d30")
