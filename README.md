@@ -51,13 +51,22 @@ sudo systemctl daemon-reload
 sudo systemctl restart funding-stack
 ```
 
-### 上线后立刻验收
+### 简短上线验收清单
 
 ```bash
-curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]))'
-sudo journalctl -u funding-stack -n 100 --no-pager
 sudo systemctl status funding-stack --no-pager
+curl -s http://127.0.0.1:5000/api/meta | python3 -c 'import sys,json; x=json.load(sys.stdin); print(x.get("baseinfoBatchCompletedAt"), x.get("historyBatchCompletedAt"))'
+curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]), sorted({v.get("status") for v in x.get("exchangeFreshness", {}).values()}))'
+curl -s "http://127.0.0.1:5000/api/data?refresh=1&rebuild=1" | python3 -c 'import sys,json; x=json.load(sys.stdin); print(x.get("generatedAt"), len(x["items"]))'
+sudo journalctl -u funding-stack -n 100 --no-pager
 ```
+
+通过标准：
+- `systemctl` 显示 `active (running)`
+- `/api/meta` 能返回 `baseinfoBatchCompletedAt` 和 `historyBatchCompletedAt`
+- `/api/data` 能返回非零的 `items/exchanges`，且 `exchangeFreshness` 有状态值
+- journal 里能看到 `baseinfo ... batch end`、`alerts(...) batch end`、`history ... batch end`
+- history 批次结束后，journal 里能看到 `materialized history summaries: rebuilt`
 
 ### 常用服务命令
 
@@ -314,7 +323,6 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 ```json
 {
   "enabled": true,
-  "cooldown_minutes": 120,
   "max_items_per_run": 20,
   "open_interest_min_musd": 3,
   "latest_pct_gte": 0.5,
@@ -333,8 +341,7 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
       "webhook_url": "",
       "secret": ""
     }
-  },
-  "state_path": "logs/alert_state.json"
+  }
 }
 ```
 
@@ -345,19 +352,18 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 - `h4_pct_gte`：过去 4 小时累计资金费率大于等于这个百分比时告警；留空或 `null` 表示不启用
 - `h4_pct_lte`：过去 4 小时累计资金费率小于等于这个百分比时告警；留空或 `null` 表示不启用
 - 兼容旧字段名：`latest_abs_pct_*` / `h4_abs_pct_*` 仍可继续使用，但现在也按带符号阈值判断；例如只想监控负值，请把 `*_lte` 配成负数，如 `-0.1`
-- `cooldown_minutes`：同一条告警在冷却时间内不会重复发送
 - `max_items_per_run`：单次通知最多展开多少条命中项
 
 先本地 dry-run 验证：
 
 ```bash
-python3 app/funding_alerts.py --config config/alerts.json --dry-run --force
+python3 app/funding_alerts.py --config config/alerts.json --dry-run
 ```
 
 如果你想单独指定配置文件：
 
 ```bash
-python3 app/funding_alerts.py --config /abs/path/to/alerts.json --dry-run --force
+python3 app/funding_alerts.py --config /abs/path/to/alerts.json --dry-run
 ```
 
 调度器启动后会自动带上告警任务；如果临时不想跑告警：
@@ -369,6 +375,8 @@ python3 -m app.run_all_funding_stack --disable-alerts
 当前调度逻辑：
 - 阈值告警不再按固定分钟轮询
 - 每次一整轮 `baseinfo` 全部结束后，调度器会立刻执行一次告警检查
+- 同一标的不再有冷静期；只要本轮仍命中阈值，就会再次发送
+- 页面不会整页刷新；前端每 `60s` 轮询 `/api/meta`，只有检测到新的 `baseinfoBatchCompletedAt` 后才拉取新 `/api/data`
 
 ## 7. 停止服务
 停止主调度/面板：
@@ -534,13 +542,15 @@ sudo systemctl restart funding-stack
 ### 10.6 上线后验收
 
 ```bash
-ps -Ao pid,etime,command | grep -E 'app.run_all_funding_stack|app.allfunding_dashboard' | grep -v grep
-curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]))'
-sudo journalctl -u funding-stack -n 200 --no-pager
+sudo systemctl status funding-stack --no-pager
+curl -s http://127.0.0.1:5000/api/meta | python3 -c 'import sys,json; x=json.load(sys.stdin); print(x.get("baseinfoBatchCompletedAt"), x.get("historyBatchCompletedAt"))'
+curl -s http://127.0.0.1:5000/api/data | python3 -c 'import sys,json; x=json.load(sys.stdin); print(len(x["items"]), len(x["exchanges"]), sorted({v.get("status") for v in x.get("exchangeFreshness", {}).values()}))'
+sudo journalctl -u funding-stack -n 200 --no-pager | egrep 'batch end|alerts\\(|materialized history summaries|warn|error'
 ```
 
 说明：
 - 健康检查不要使用 `HEAD /`，建议使用 `GET /` 或 `GET /api/data`。
+- 如果你要验证强制重建路径，可手动请求一次 `GET /api/data?refresh=1&rebuild=1`。
 - 单个交易所脚本也可以直接运行，路径统一位于 `exchanges/<exchange>/`。
 
 ## 11. systemd 服务

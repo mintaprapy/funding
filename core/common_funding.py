@@ -11,6 +11,18 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 15_000
+SCHEMA_META_TABLE = "schema_meta"
+BASEINFO_NUMERIC_SHADOW_COLUMNS: dict[str, str] = {
+    "adjustedFundingRateCap": "adjustedFundingRateCapNum",
+    "adjustedFundingRateFloor": "adjustedFundingRateFloorNum",
+    "markPrice": "markPriceNum",
+    "lastFundingRate": "lastFundingRateNum",
+    "openInterest": "openInterestNum",
+    "insuranceBalance": "insuranceBalanceNum",
+}
+HISTORY_NUMERIC_SHADOW_COLUMNS: dict[str, str] = {
+    "fundingRate": "fundingRateNum",
+}
 
 
 def _collector_log_message(
@@ -70,8 +82,14 @@ def tune_sqlite_connection(
     """Apply shared SQLite runtime pragmas for better writer/reader concurrency."""
     timeout_ms = max(1000, int(busy_timeout_ms))
     conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        pass
 
 
 def to_plain_str(val: Any) -> str | None:
@@ -120,6 +138,120 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
+def _ensure_schema_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {SCHEMA_META_TABLE} (
+            key TEXT PRIMARY KEY,
+            updated_at INTEGER
+        )
+        """
+    )
+
+
+def _schema_migration_applied(conn: sqlite3.Connection, key: str) -> bool:
+    _ensure_schema_meta_table(conn)
+    row = conn.execute(f"SELECT 1 FROM {SCHEMA_META_TABLE} WHERE key=? LIMIT 1", (key,)).fetchone()
+    return row is not None
+
+
+def _mark_schema_migration_applied(conn: sqlite3.Connection, key: str) -> None:
+    _ensure_schema_meta_table(conn)
+    conn.execute(
+        f"""
+        INSERT INTO {SCHEMA_META_TABLE} (key, updated_at)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            updated_at=excluded.updated_at
+        """,
+        (key, int(time.time() * 1000)),
+    )
+
+
+def _numeric_shadow_expr(column: str) -> str:
+    return f"CASE WHEN {column} IS NULL OR TRIM({column}) = '' THEN NULL ELSE CAST({column} AS REAL) END"
+
+
+def _ensure_numeric_shadow_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    mapping: dict[str, str],
+) -> None:
+    for shadow_column in mapping.values():
+        ensure_column(conn, table, shadow_column, "REAL")
+
+
+def _ensure_numeric_shadow_triggers(
+    conn: sqlite3.Connection,
+    table: str,
+    mapping: dict[str, str],
+) -> None:
+    if not mapping:
+        return
+    assignments = ", ".join(f"{shadow}=({_numeric_shadow_expr(source)})" for source, shadow in mapping.items())
+    watched_columns = ", ".join(mapping.keys())
+    insert_trigger = f"trg_{table}_sync_num_ai"
+    update_trigger = f"trg_{table}_sync_num_au"
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS {insert_trigger}
+        AFTER INSERT ON {table}
+        BEGIN
+            UPDATE {table}
+            SET {assignments}
+            WHERE rowid = NEW.rowid;
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS {update_trigger}
+        AFTER UPDATE OF {watched_columns} ON {table}
+        BEGIN
+            UPDATE {table}
+            SET {assignments}
+            WHERE rowid = NEW.rowid;
+        END
+        """
+    )
+
+
+def _backfill_numeric_shadow_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    mapping: dict[str, str],
+) -> None:
+    if not mapping:
+        return
+    assignments = ", ".join(f"{shadow}=({_numeric_shadow_expr(source)})" for source, shadow in mapping.items())
+    conn.execute(f"UPDATE {table} SET {assignments}")
+
+
+def ensure_numeric_shadow_layout(
+    conn: sqlite3.Connection,
+    table: str,
+    mapping: dict[str, str],
+    *,
+    version: str = "v1",
+) -> None:
+    if not mapping:
+        return
+    _ensure_numeric_shadow_columns(conn, table, mapping)
+    _ensure_numeric_shadow_triggers(conn, table, mapping)
+    migration_key = f"{version}:numeric_shadow:{table}"
+    if not _schema_migration_applied(conn, migration_key):
+        _backfill_numeric_shadow_columns(conn, table, mapping)
+        _mark_schema_migration_applied(conn, migration_key)
+
+
+def ensure_baseinfo_numeric_layout(conn: sqlite3.Connection, table: str) -> None:
+    ensure_numeric_shadow_layout(conn, table, BASEINFO_NUMERIC_SHADOW_COLUMNS)
+
+
+def ensure_history_numeric_layout(conn: sqlite3.Connection, table: str) -> None:
+    ensure_numeric_shadow_layout(conn, table, HISTORY_NUMERIC_SHADOW_COLUMNS)
+
+
 def ensure_baseinfo_table(conn: sqlite3.Connection, table: str) -> None:
     tune_sqlite_connection(conn)
     conn.execute(
@@ -138,6 +270,7 @@ def ensure_baseinfo_table(conn: sqlite3.Connection, table: str) -> None:
         """
     )
     ensure_column(conn, table, "insuranceBalance", "TEXT")
+    ensure_baseinfo_numeric_layout(conn, table)
     conn.commit()
 
 
@@ -154,6 +287,8 @@ def ensure_history_table(conn: sqlite3.Connection, table: str) -> None:
         )
         """
     )
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_fundingTime ON {table}(fundingTime)")
+    ensure_history_numeric_layout(conn, table)
     conn.commit()
 
 

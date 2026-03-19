@@ -40,6 +40,7 @@ HISTORY_FRAGILE_EXCHANGES = frozenset({"grvt", "edgex"})
 HISTORY_DEDICATED_LANES = {"binance": "binance"}
 APP_META_TABLE = "app_meta"
 BASEINFO_BATCH_COMPLETED_AT_KEY = "baseinfo_batch_completed_at"
+HISTORY_BATCH_COMPLETED_AT_KEY = "history_batch_completed_at"
 
 @dataclass
 class Job:
@@ -423,6 +424,15 @@ def run_batch(
             record_baseinfo_batch_completed_at(db_path, int(time.time() * 1000))
         except Exception as exc:  # noqa: BLE001
             log(f"[{now_str()}] [warn] failed to record baseinfo batch completion: {exc}")
+    if db_path is not None and name.startswith("history") and not stop_requested:
+        try:
+            record_history_batch_completed_at(db_path, int(time.time() * 1000))
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{now_str()}] [warn] failed to record history batch completion: {exc}")
+        try:
+            refresh_dashboard_history_summaries()
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{now_str()}] [warn] failed to refresh materialized history summaries: {exc}")
 
 
 def stop_dashboard(proc: subprocess.Popen[str] | None) -> None:
@@ -472,6 +482,17 @@ def prepare_sqlite_runtime(db_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         tune_sqlite_connection(conn)
         conn.commit()
+    from app.allfunding_dashboard import initialize_dashboard_runtime
+
+    initialize_dashboard_runtime(apply_legacy_migrations=True)
+
+
+def refresh_dashboard_history_summaries() -> None:
+    from app.allfunding_dashboard import refresh_materialized_history_summaries
+
+    changed = refresh_materialized_history_summaries(force=True)
+    status = "rebuilt" if changed else "skipped"
+    log(f"[{now_str()}] materialized history summaries: {status}")
 
 
 def _ensure_app_meta_table(conn: sqlite3.Connection) -> None:
@@ -512,6 +533,15 @@ def record_baseinfo_batch_completed_at(db_path: Path, completed_at_ms: int) -> N
     record_app_meta_value(
         db_path,
         BASEINFO_BATCH_COMPLETED_AT_KEY,
+        str(completed_at_ms),
+        completed_at_ms,
+    )
+
+
+def record_history_batch_completed_at(db_path: Path, completed_at_ms: int) -> None:
+    record_app_meta_value(
+        db_path,
+        HISTORY_BATCH_COMPLETED_AT_KEY,
         str(completed_at_ms),
         completed_at_ms,
     )

@@ -1,6 +1,5 @@
 {
   "enabled": false,
-  "cooldown_minutes": 15,
   "max_items_per_run": 30,
   "open_interest_min_musd": 3,
   "latest_pct_gte": 0.1,
@@ -19,6 +18,5 @@
       "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-id",
       "secret": ""
     }
-  },
-  "state_path": "logs/alert_state.json"
+  }
 }

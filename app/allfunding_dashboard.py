@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 import argparse
+import gzip
+import hashlib
 import json
 import sqlite3
 import sys
@@ -19,38 +21,78 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.common_funding import to_plain_str, tune_sqlite_connection
+from core.common_funding import (
+    ensure_baseinfo_numeric_layout,
+    ensure_history_table as ensure_shared_history_table,
+    to_plain_str,
+    tune_sqlite_connection,
+)
 from core.funding_exchanges import dashboard_exchange_meta
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT / "funding.db")).expanduser().resolve()
 HOST = "127.0.0.1"
 PORT = 5000
 
+WindowDef = tuple[str, int, str]
+
 # key, window in ms, label for UI
-WINDOWS = [
+WINDOWS: tuple[WindowDef, ...] = (
     ("h24", 24 * 60 * 60 * 1000, "24 小时"),
     ("d3", 3 * 24 * 60 * 60 * 1000, "3 天"),
     ("d7", 7 * 24 * 60 * 60 * 1000, "7 天"),
     ("d15", 15 * 24 * 60 * 60 * 1000, "15 天"),
     ("d30", 30 * 24 * 60 * 60 * 1000, "30 天"),
-]
+)
+BASE_WINDOW_KEYS = frozenset(key for key, _, _ in WINDOWS)
+MATERIALIZED_EXTRA_WINDOWS: tuple[WindowDef, ...] = (
+    ("h4", 4 * 60 * 60 * 1000, "4 小时"),
+)
 
 EXCHANGES: dict[str, dict[str, Any]] = dashboard_exchange_meta(ROOT)
 
 MAX_WINDOW_MS = max(span for _, span, _ in WINDOWS)
 PAYLOAD_CACHE_TTL_SEC = 10.0
+GZIP_MIN_BYTES = 1400
+GZIP_COMPRESSLEVEL = 5
+SLOW_META_BUILD_MS = 1000.0
+SLOW_PAYLOAD_BUILD_MS = 3000.0
+SLOW_HTTP_META_MS = 1500.0
+SLOW_HTTP_DATA_MS = 5000.0
+BASEINFO_INTERVAL_MS = 10 * 60 * 1000
+EXCHANGE_FRESH_LAG_MS = 2 * 60 * 1000
 
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_PREPARED = False
 _INFO_TABLE_BY_EXCHANGE: dict[str, str] = {}
 
 _PAYLOAD_CACHE_LOCK = threading.Lock()
+_PAYLOAD_CACHE_COND = threading.Condition(_PAYLOAD_CACHE_LOCK)
 _PAYLOAD_CACHE: dict[str, Any] | None = None
+_PAYLOAD_CACHE_JSON: bytes | None = None
 _PAYLOAD_CACHE_TS = 0.0
+_PAYLOAD_CACHE_BASEINFO_BATCH_COMPLETED_AT: int | None = None
+_PAYLOAD_CACHE_HISTORY_BATCH_COMPLETED_AT: int | None = None
+_PAYLOAD_CACHE_WINDOWS_SIGNATURE: tuple[tuple[str, int], ...] | None = None
+_PAYLOAD_CACHE_ETAG: str | None = None
+_PAYLOAD_BUILD_IN_PROGRESS = False
+
+_HISTORY_SUMS_CACHE_LOCK = threading.Lock()
+_HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT: int | None = None
+_HISTORY_SUMS_CACHE_ANCHOR_MS: int | None = None
+_HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE: tuple[tuple[str, int], ...] | None = None
+_HISTORY_SUMS_CACHE: dict[str, dict[str, dict[str, Any]]] | None = None
+
+_LEGACY_MIGRATIONS_LOCK = threading.Lock()
+_LEGACY_MIGRATIONS_PREPARED = False
 
 APP_META_TABLE = "app_meta"
+HISTORY_WINDOW_SUMMARIES_TABLE = "history_window_summaries"
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 BASEINFO_BATCH_COMPLETED_AT_KEY = "baseinfo_batch_completed_at"
+HISTORY_BATCH_COMPLETED_AT_KEY = "history_batch_completed_at"
+HISTORY_SUMMARIES_WINDOW_SIG_KEY = "history_summaries_window_sig"
+HISTORY_SUMMARIES_BATCH_COMPLETED_AT_KEY = "history_summaries_batch_completed_at"
+HISTORY_SUMMARIES_ANCHOR_MS_KEY = "history_summaries_anchor_ms"
 
 
 def _to_number(val: Any) -> float | None:
@@ -119,6 +161,85 @@ def _to_int(val: Any) -> int | None:
         return None
 
 
+def merge_windows(extra_windows: tuple[WindowDef, ...] | None = None) -> tuple[WindowDef, ...]:
+    merged = list(WINDOWS)
+    seen = {key for key, _, _ in WINDOWS}
+    for key, span, label in extra_windows or ():
+        if key in seen:
+            continue
+        merged.append((key, span, label))
+        seen.add(key)
+    return tuple(merged)
+
+
+def windows_signature(windows: tuple[WindowDef, ...]) -> tuple[tuple[str, int], ...]:
+    return tuple((key, span) for key, span, _ in windows)
+
+
+def materialized_windows_for(windows: tuple[WindowDef, ...]) -> tuple[WindowDef, ...]:
+    requested_extra_windows = tuple((key, span, label) for key, span, label in windows if key not in BASE_WINDOW_KEYS)
+    return merge_windows(MATERIALIZED_EXTRA_WINDOWS + requested_extra_windows)
+
+
+def _etag_for_bytes(data: bytes) -> str:
+    return f'W/"{hashlib.blake2b(data, digest_size=16).hexdigest()}"'
+
+
+def _dashboard_log(message: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [dashboard] {message}", flush=True)
+
+
+def _log_if_slow(name: str, total_ms: float, threshold_ms: float, **metrics: Any) -> None:
+    if total_ms < threshold_ms:
+        return
+    parts = [f"{key}={value}" for key, value in metrics.items()]
+    suffix = f" {' '.join(parts)}" if parts else ""
+    _dashboard_log(f"slow {name}: {total_ms:.1f}ms{suffix}")
+
+
+def _fetch_app_meta_timestamp(conn: sqlite3.Connection, key: str) -> int | None:
+    if not _table_exists(conn, APP_META_TABLE):
+        return None
+    row = conn.execute(
+        f"SELECT value, updated_at FROM {APP_META_TABLE} WHERE key=? LIMIT 1",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    ts = _to_int(row["value"])
+    if ts is None:
+        ts = _to_int(row["updated_at"])
+    return ts
+
+
+def _fetch_app_meta_value(conn: sqlite3.Connection, key: str) -> str | None:
+    if not _table_exists(conn, APP_META_TABLE):
+        return None
+    row = conn.execute(
+        f"SELECT value FROM {APP_META_TABLE} WHERE key=? LIMIT 1",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    value = row["value"]
+    return None if value is None else str(value)
+
+
+def _upsert_app_meta_value(conn: sqlite3.Connection, key: str, value: str, *, updated_at_ms: int | None = None) -> None:
+    _ensure_app_meta_table(conn)
+    ts = int(time.time() * 1000) if updated_at_ms is None else int(updated_at_ms)
+    conn.execute(
+        f"""
+        INSERT INTO {APP_META_TABLE} (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value=excluded.value,
+            updated_at=excluded.updated_at
+        """,
+        (key, value, ts),
+    )
+
+
 def fetch_exchange_baseinfo_completed_at(conn: sqlite3.Connection) -> dict[str, int]:
     if not _table_exists(conn, APP_META_TABLE):
         return {}
@@ -145,18 +266,54 @@ def fetch_exchange_baseinfo_completed_at(conn: sqlite3.Connection) -> dict[str, 
 
 
 def fetch_baseinfo_batch_completed_at(conn: sqlite3.Connection) -> int | None:
-    if not _table_exists(conn, APP_META_TABLE):
-        return None
-    row = conn.execute(
-        f"SELECT value, updated_at FROM {APP_META_TABLE} WHERE key=? LIMIT 1",
-        (BASEINFO_BATCH_COMPLETED_AT_KEY,),
-    ).fetchone()
-    if row is None:
-        return None
-    ts = _to_int(row["value"])
-    if ts is None:
-        ts = _to_int(row["updated_at"])
-    return ts
+    return _fetch_app_meta_timestamp(conn, BASEINFO_BATCH_COMPLETED_AT_KEY)
+
+
+def fetch_history_batch_completed_at(conn: sqlite3.Connection) -> int | None:
+    return _fetch_app_meta_timestamp(conn, HISTORY_BATCH_COMPLETED_AT_KEY)
+
+
+def fetch_batch_completion_markers(conn: sqlite3.Connection) -> tuple[int | None, int | None]:
+    return (
+        fetch_baseinfo_batch_completed_at(conn),
+        fetch_history_batch_completed_at(conn),
+    )
+
+
+def build_exchange_freshness(
+    exchange_updated_at: dict[str, int],
+    *,
+    baseinfo_batch_completed_at: int | None,
+    now_ms: int,
+) -> dict[str, dict[str, int | str | None]]:
+    freshness: dict[str, dict[str, int | str | None]] = {}
+    for exchange in EXCHANGES:
+        updated_at = exchange_updated_at.get(exchange)
+        if updated_at is None:
+            freshness[exchange] = {
+                "status": "missing",
+                "updatedAt": None,
+                "lagMs": None,
+                "ageMs": None,
+            }
+            continue
+        age_ms = max(0, now_ms - updated_at)
+        lag_ms = None if baseinfo_batch_completed_at is None else max(0, baseinfo_batch_completed_at - updated_at)
+        status = "unknown"
+        if lag_ms is not None:
+            if lag_ms <= EXCHANGE_FRESH_LAG_MS:
+                status = "fresh"
+            elif lag_ms <= BASEINFO_INTERVAL_MS:
+                status = "lagging"
+            else:
+                status = "stale"
+        freshness[exchange] = {
+            "status": status,
+            "updatedAt": updated_at,
+            "lagMs": lag_ms,
+            "ageMs": age_ms,
+        }
+    return freshness
 
 
 def _normalize_legacy_bps_columns(
@@ -545,21 +702,7 @@ def ensure_info_table(conn: sqlite3.Connection, table: str) -> None:
         """
     )
     ensure_column(conn, table, "insuranceBalance", "TEXT")
-
-
-def ensure_history_table(conn: sqlite3.Connection, table: str) -> None:
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            symbol TEXT NOT NULL,
-            fundingTime INTEGER NOT NULL,
-            fundingRate TEXT,
-            updated_at INTEGER,
-            PRIMARY KEY (symbol, fundingTime)
-        )
-        """
-    )
-    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_fundingTime ON {table}(fundingTime)")
+    ensure_baseinfo_numeric_layout(conn, table)
 
 
 def resolve_info_table(conn: sqlite3.Connection, candidates: list[str]) -> str:
@@ -585,19 +728,43 @@ def prepare_schema(conn: sqlite3.Connection) -> None:
         for exchange, meta in EXCHANGES.items():
             info_table = resolve_info_table(conn, list(meta["info_table_candidates"]))
             history_table = str(meta["history_table"])
-            ensure_history_table(conn, history_table)
+            ensure_baseinfo_numeric_layout(conn, info_table)
+            ensure_shared_history_table(conn, history_table)
             mapping[exchange] = info_table
-        normalize_legacy_units(conn)
         _INFO_TABLE_BY_EXCHANGE = mapping
         _SCHEMA_PREPARED = True
+
+
+def prepare_legacy_migrations(conn: sqlite3.Connection) -> None:
+    global _LEGACY_MIGRATIONS_PREPARED
+    if _LEGACY_MIGRATIONS_PREPARED:
+        return
+    with _LEGACY_MIGRATIONS_LOCK:
+        if _LEGACY_MIGRATIONS_PREPARED:
+            return
+        normalize_legacy_units(conn)
+        _LEGACY_MIGRATIONS_PREPARED = True
+
+
+def initialize_dashboard_runtime(*, apply_legacy_migrations: bool = False) -> None:
+    with connect_db() as conn:
+        prepare_schema(conn)
+        if apply_legacy_migrations:
+            prepare_legacy_migrations(conn)
 
 
 def fetch_base_info(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
     cur = conn.execute(
         f"""
-        SELECT symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
-               fundingIntervalHours, markPrice, lastFundingRate, openInterest,
-               insuranceBalance, updated_at
+        SELECT symbol,
+               COALESCE(adjustedFundingRateCapNum, CASE WHEN adjustedFundingRateCap IS NULL OR TRIM(adjustedFundingRateCap) = '' THEN NULL ELSE CAST(adjustedFundingRateCap AS REAL) END) AS adjustedFundingRateCap,
+               COALESCE(adjustedFundingRateFloorNum, CASE WHEN adjustedFundingRateFloor IS NULL OR TRIM(adjustedFundingRateFloor) = '' THEN NULL ELSE CAST(adjustedFundingRateFloor AS REAL) END) AS adjustedFundingRateFloor,
+               fundingIntervalHours,
+               COALESCE(markPriceNum, CASE WHEN markPrice IS NULL OR TRIM(markPrice) = '' THEN NULL ELSE CAST(markPrice AS REAL) END) AS markPrice,
+               COALESCE(lastFundingRateNum, CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate) = '' THEN NULL ELSE CAST(lastFundingRate AS REAL) END) AS lastFundingRate,
+               COALESCE(openInterestNum, CASE WHEN openInterest IS NULL OR TRIM(openInterest) = '' THEN NULL ELSE CAST(openInterest AS REAL) END) AS openInterest,
+               COALESCE(insuranceBalanceNum, CASE WHEN insuranceBalance IS NULL OR TRIM(insuranceBalance) = '' THEN NULL ELSE CAST(insuranceBalance AS REAL) END) AS insuranceBalance,
+               updated_at
         FROM {table}
         ORDER BY symbol
         """
@@ -626,13 +793,14 @@ def fetch_cumulative_rates(
     history_table: str,
     now_ms: int,
     allow_partial: bool = False,
+    windows: tuple[WindowDef, ...] = WINDOWS,
 ) -> dict[str, dict[str, Any]]:
     params: list[int] = []
     case_parts = [
-        f"COALESCE(SUM(CASE WHEN fundingTime >= ? AND fundingTime <= ? THEN CAST(fundingRate AS REAL) ELSE 0 END), 0) AS {key}"
-        for key, span, _ in WINDOWS
+        f"COALESCE(SUM(CASE WHEN fundingTime >= ? AND fundingTime <= ? THEN COALESCE(fundingRateNum, CASE WHEN fundingRate IS NULL OR TRIM(fundingRate) = '' THEN NULL ELSE CAST(fundingRate AS REAL) END) ELSE 0 END), 0) AS {key}"
+        for key, span, _ in windows
     ]
-    for _, span, _ in WINDOWS:
+    for _, span, _ in windows:
         params.extend([now_ms - span, now_ms])
     sql = f"""
         SELECT symbol,
@@ -650,7 +818,7 @@ def fetch_cumulative_rates(
         sums: dict[str, float | None] = {}
         partial: dict[str, bool] = {}
         coverage_ms: dict[str, int | None] = {}
-        for key, span, _ in WINDOWS:
+        for key, span, _ in windows:
             mature = oldest_ms is not None and oldest_ms <= now_ms - span
             observed_ms = None if oldest_ms is None else max(0, now_ms - oldest_ms)
             use_partial = bool(allow_partial and oldest_ms is not None and not mature)
@@ -665,31 +833,336 @@ def fetch_cumulative_rates(
     return result
 
 
-def _build_payload_uncached() -> dict[str, Any]:
+def _ensure_history_window_summaries_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {HISTORY_WINDOW_SUMMARIES_TABLE} (
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            window_key TEXT NOT NULL,
+            window_span_ms INTEGER NOT NULL,
+            batch_completed_at INTEGER,
+            anchor_ms INTEGER NOT NULL,
+            sum_value REAL,
+            is_partial INTEGER NOT NULL,
+            coverage_ms INTEGER,
+            PRIMARY KEY (exchange, symbol, window_key, window_span_ms)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{HISTORY_WINDOW_SUMMARIES_TABLE}_exchange_symbol
+        ON {HISTORY_WINDOW_SUMMARIES_TABLE}(exchange, symbol)
+        """
+    )
+
+
+def _history_summary_window_sig(windows: tuple[WindowDef, ...]) -> str:
+    return json.dumps(windows_signature(windows), separators=(",", ":"), ensure_ascii=False)
+
+
+def _materialized_history_summaries_are_current(
+    conn: sqlite3.Connection,
+    *,
+    history_batch_completed_at: int | None,
+    history_anchor_ms: int,
+    windows: tuple[WindowDef, ...],
+) -> bool:
+    if history_batch_completed_at is None:
+        return False
+    return (
+        _fetch_app_meta_value(conn, HISTORY_SUMMARIES_WINDOW_SIG_KEY) == _history_summary_window_sig(windows)
+        and _to_int(_fetch_app_meta_value(conn, HISTORY_SUMMARIES_BATCH_COMPLETED_AT_KEY)) == history_batch_completed_at
+        and _to_int(_fetch_app_meta_value(conn, HISTORY_SUMMARIES_ANCHOR_MS_KEY)) == history_anchor_ms
+    )
+
+
+def _load_materialized_history_summaries(
+    conn: sqlite3.Connection,
+    *,
+    windows: tuple[WindowDef, ...],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    _ensure_history_window_summaries_table(conn)
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    default_sums = {key: None for key, _, _ in windows}
+    default_partial = {key: False for key, _, _ in windows}
+    default_coverage = {key: None for key, _, _ in windows}
+    expected_keys = {key for key, _, _ in windows}
+
+    rows = conn.execute(
+        f"""
+        SELECT exchange, symbol, window_key, sum_value, is_partial, coverage_ms
+        FROM {HISTORY_WINDOW_SUMMARIES_TABLE}
+        ORDER BY exchange, symbol, window_key
+        """
+    ).fetchall()
+    for row in rows:
+        exchange = str(row["exchange"])
+        symbol = str(row["symbol"])
+        window_key = str(row["window_key"])
+        if window_key not in expected_keys:
+            continue
+        exchange_rows = result.setdefault(exchange, {})
+        bundle = exchange_rows.setdefault(
+            symbol,
+            {
+                "values": dict(default_sums),
+                "partial": dict(default_partial),
+                "coverageMs": dict(default_coverage),
+            },
+        )
+        bundle["values"][window_key] = _to_number(row["sum_value"])
+        bundle["partial"][window_key] = bool(row["is_partial"])
+        bundle["coverageMs"][window_key] = _to_int(row["coverage_ms"])
+    return result
+
+
+def _store_materialized_history_summaries(
+    conn: sqlite3.Connection,
+    *,
+    history_sums_by_exchange: dict[str, dict[str, dict[str, Any]]],
+    history_batch_completed_at: int,
+    history_anchor_ms: int,
+    windows: tuple[WindowDef, ...],
+) -> None:
+    _ensure_history_window_summaries_table(conn)
     now_ms = int(time.time() * 1000)
-    items: list[dict[str, Any]] = []
+    rows: list[tuple[Any, ...]] = []
+    for exchange, symbol_map in history_sums_by_exchange.items():
+        for symbol, bundle in symbol_map.items():
+            values = bundle.get("values") or {}
+            partial = bundle.get("partial") or {}
+            coverage = bundle.get("coverageMs") or {}
+            for key, span, _ in windows:
+                rows.append(
+                    (
+                        exchange,
+                        symbol,
+                        key,
+                        span,
+                        history_batch_completed_at,
+                        history_anchor_ms,
+                        values.get(key),
+                        1 if partial.get(key) else 0,
+                        coverage.get(key),
+                    )
+                )
+
+    conn.execute(f"DELETE FROM {HISTORY_WINDOW_SUMMARIES_TABLE}")
+    if rows:
+        conn.executemany(
+            f"""
+            INSERT INTO {HISTORY_WINDOW_SUMMARIES_TABLE} (
+                exchange, symbol, window_key, window_span_ms,
+                batch_completed_at, anchor_ms, sum_value, is_partial, coverage_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    _upsert_app_meta_value(
+        conn,
+        HISTORY_SUMMARIES_WINDOW_SIG_KEY,
+        _history_summary_window_sig(windows),
+        updated_at_ms=now_ms,
+    )
+    _upsert_app_meta_value(
+        conn,
+        HISTORY_SUMMARIES_BATCH_COMPLETED_AT_KEY,
+        str(history_batch_completed_at),
+        updated_at_ms=now_ms,
+    )
+    _upsert_app_meta_value(
+        conn,
+        HISTORY_SUMMARIES_ANCHOR_MS_KEY,
+        str(history_anchor_ms),
+        updated_at_ms=now_ms,
+    )
+    conn.commit()
+
+
+def _build_history_sums_by_exchange(
+    conn: sqlite3.Connection,
+    *,
+    history_anchor_ms: int,
+    windows: tuple[WindowDef, ...],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    history_sums_by_exchange: dict[str, dict[str, dict[str, Any]]] = {}
+    for exchange, meta in EXCHANGES.items():
+        history_sums_by_exchange[exchange] = fetch_cumulative_rates(
+            conn,
+            history_table=str(meta["history_table"]),
+            now_ms=history_anchor_ms,
+            allow_partial=bool(meta.get("allow_partial_window_sums")),
+            windows=windows,
+        )
+    return history_sums_by_exchange
+
+
+def get_history_sums_by_exchange(
+    conn: sqlite3.Connection,
+    *,
+    history_batch_completed_at: int | None,
+    history_anchor_ms: int,
+    windows: tuple[WindowDef, ...],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    global _HISTORY_SUMS_CACHE
+    global _HISTORY_SUMS_CACHE_ANCHOR_MS
+    global _HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT
+    global _HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE
+
+    materialized_windows = materialized_windows_for(windows)
+    signature = windows_signature(materialized_windows)
+
+    with _HISTORY_SUMS_CACHE_LOCK:
+        if (
+            _HISTORY_SUMS_CACHE is not None
+            and _HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT == history_batch_completed_at
+            and _HISTORY_SUMS_CACHE_ANCHOR_MS == history_anchor_ms
+            and _HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE == signature
+        ):
+            return _HISTORY_SUMS_CACHE
+
+    if _materialized_history_summaries_are_current(
+        conn,
+        history_batch_completed_at=history_batch_completed_at,
+        history_anchor_ms=history_anchor_ms,
+        windows=materialized_windows,
+    ):
+        history_sums_by_exchange = _load_materialized_history_summaries(
+            conn,
+            windows=materialized_windows,
+        )
+        if not history_sums_by_exchange:
+            history_sums_by_exchange = _build_history_sums_by_exchange(
+                conn,
+                history_anchor_ms=history_anchor_ms,
+                windows=materialized_windows,
+            )
+    else:
+        history_sums_by_exchange = _build_history_sums_by_exchange(
+            conn,
+            history_anchor_ms=history_anchor_ms,
+            windows=materialized_windows,
+        )
+        if history_batch_completed_at is not None:
+            _store_materialized_history_summaries(
+                conn,
+                history_sums_by_exchange=history_sums_by_exchange,
+                history_batch_completed_at=history_batch_completed_at,
+                history_anchor_ms=history_anchor_ms,
+                windows=materialized_windows,
+            )
+    with _HISTORY_SUMS_CACHE_LOCK:
+        if (
+            _HISTORY_SUMS_CACHE is None
+            or _HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT != history_batch_completed_at
+            or _HISTORY_SUMS_CACHE_ANCHOR_MS != history_anchor_ms
+            or _HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE != signature
+        ):
+            _HISTORY_SUMS_CACHE = history_sums_by_exchange
+            _HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT = history_batch_completed_at
+            _HISTORY_SUMS_CACHE_ANCHOR_MS = history_anchor_ms
+            _HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE = signature
+        return _HISTORY_SUMS_CACHE
+
+
+def refresh_materialized_history_summaries(*, force: bool = False) -> bool:
+    initialize_dashboard_runtime(apply_legacy_migrations=True)
     with connect_db() as conn:
         prepare_schema(conn)
+        _, history_batch_completed_at = fetch_batch_completion_markers(conn)
+        if history_batch_completed_at is None:
+            return False
+        history_anchor_ms = history_batch_completed_at
+        windows = materialized_windows_for(WINDOWS)
+        if (
+            not force
+            and _materialized_history_summaries_are_current(
+                conn,
+                history_batch_completed_at=history_batch_completed_at,
+                history_anchor_ms=history_anchor_ms,
+                windows=windows,
+            )
+        ):
+            return False
+        history_sums_by_exchange = _build_history_sums_by_exchange(
+            conn,
+            history_anchor_ms=history_anchor_ms,
+            windows=windows,
+        )
+        _store_materialized_history_summaries(
+            conn,
+            history_sums_by_exchange=history_sums_by_exchange,
+            history_batch_completed_at=history_batch_completed_at,
+            history_anchor_ms=history_anchor_ms,
+            windows=windows,
+        )
+    with _HISTORY_SUMS_CACHE_LOCK:
+        global _HISTORY_SUMS_CACHE
+        global _HISTORY_SUMS_CACHE_ANCHOR_MS
+        global _HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT
+        global _HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE
+        _HISTORY_SUMS_CACHE = history_sums_by_exchange
+        _HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT = history_batch_completed_at
+        _HISTORY_SUMS_CACHE_ANCHOR_MS = history_anchor_ms
+        _HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE = windows_signature(windows)
+    return True
+
+
+def _build_payload_uncached(
+    *,
+    markers: tuple[int | None, int | None] | None = None,
+    windows: tuple[WindowDef, ...] = WINDOWS,
+    perf: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    items: list[dict[str, Any]] = []
+    prepare_schema_ms = 0.0
+    exchange_markers_ms = 0.0
+    marker_read_ms = 0.0
+    history_sums_ms = 0.0
+    base_rows_ms = 0.0
+    item_assembly_ms = 0.0
+    with connect_db() as conn:
+        stage_started = time.perf_counter()
+        prepare_schema(conn)
+        prepare_schema_ms = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
         exchange_updated_at = fetch_exchange_baseinfo_completed_at(conn)
-        baseinfo_batch_completed_at = fetch_baseinfo_batch_completed_at(conn)
+        exchange_markers_ms = (time.perf_counter() - stage_started) * 1000.0
+
+        if markers is None:
+            stage_started = time.perf_counter()
+            markers = fetch_batch_completion_markers(conn)
+            marker_read_ms = (time.perf_counter() - stage_started) * 1000.0
+        baseinfo_batch_completed_at, history_batch_completed_at = markers
+        history_anchor_ms = history_batch_completed_at or now_ms
+        stage_started = time.perf_counter()
+        history_sums_by_exchange = get_history_sums_by_exchange(
+            conn,
+            history_batch_completed_at=history_batch_completed_at,
+            history_anchor_ms=history_anchor_ms,
+            windows=windows,
+        )
+        history_sums_ms = (time.perf_counter() - stage_started) * 1000.0
         fallback_exchange_updated_at: dict[str, int] = {}
         for exchange, meta in EXCHANGES.items():
             info_table = _INFO_TABLE_BY_EXCHANGE.get(exchange)
             if info_table is None:
                 info_table = resolve_info_table(conn, list(meta["info_table_candidates"]))
                 _INFO_TABLE_BY_EXCHANGE[exchange] = info_table
-            history_table = str(meta["history_table"])
+            stage_started = time.perf_counter()
             base_rows = fetch_base_info(conn, info_table)
-            sums_by_symbol = fetch_cumulative_rates(
-                conn,
-                history_table=history_table,
-                now_ms=now_ms,
-                allow_partial=bool(meta.get("allow_partial_window_sums")),
-            )
-            default_sums = {key: None for key, _, _ in WINDOWS}
-            default_partial = {key: False for key, _, _ in WINDOWS}
-            default_coverage = {key: None for key, _, _ in WINDOWS}
+            base_rows_ms += (time.perf_counter() - stage_started) * 1000.0
+            sums_by_symbol = history_sums_by_exchange.get(exchange, {})
+            default_sums = {key: None for key, _, _ in windows}
+            default_partial = {key: False for key, _, _ in windows}
+            default_coverage = {key: None for key, _, _ in windows}
 
+            stage_started = time.perf_counter()
             for row in base_rows:
                 sum_bundle = sums_by_symbol.get(
                     row["symbol"],
@@ -720,41 +1193,222 @@ def _build_payload_uncached() -> dict[str, Any]:
                         fallback_exchange_updated_at.get(exchange, 0),
                         int(row["updated_at"]),
                     )
+            item_assembly_ms += (time.perf_counter() - stage_started) * 1000.0
         for exchange, ts in fallback_exchange_updated_at.items():
             exchange_updated_at.setdefault(exchange, ts)
+
+    exchange_freshness = build_exchange_freshness(
+        exchange_updated_at,
+        baseinfo_batch_completed_at=baseinfo_batch_completed_at,
+        now_ms=now_ms,
+    )
+    if perf is not None:
+        perf["prepare_schema_ms"] = round(prepare_schema_ms, 1)
+        perf["exchange_markers_ms"] = round(exchange_markers_ms, 1)
+        perf["marker_read_ms"] = round(marker_read_ms, 1)
+        perf["history_sums_ms"] = round(history_sums_ms, 1)
+        perf["base_rows_ms"] = round(base_rows_ms, 1)
+        perf["item_assembly_ms"] = round(item_assembly_ms, 1)
+        perf["item_count"] = float(len(items))
 
     return {
         "generatedAt": now_ms,
         "baseinfoBatchCompletedAt": baseinfo_batch_completed_at,
-        "windows": [{"key": key, "label": label, "spanMs": span} for key, span, label in WINDOWS],
+        "historyBatchCompletedAt": history_batch_completed_at,
+        "windows": [{"key": key, "label": label, "spanMs": span} for key, span, label in windows],
         "exchanges": [{"key": k, "label": str(v["label"])} for k, v in EXCHANGES.items()],
         "exchangeUpdatedAt": exchange_updated_at,
+        "exchangeFreshness": exchange_freshness,
         "items": items,
     }
 
 
 def build_meta_payload() -> dict[str, Any]:
+    started = time.perf_counter()
     with connect_db() as conn:
-        return {
+        marker_started = time.perf_counter()
+        baseinfo_batch_completed_at, history_batch_completed_at = fetch_batch_completion_markers(conn)
+        marker_read_ms = (time.perf_counter() - marker_started) * 1000.0
+        payload = {
             "generatedAt": int(time.time() * 1000),
-            "baseinfoBatchCompletedAt": fetch_baseinfo_batch_completed_at(conn),
+            "baseinfoBatchCompletedAt": baseinfo_batch_completed_at,
+            "historyBatchCompletedAt": history_batch_completed_at,
         }
+    _log_if_slow(
+        "build_meta_payload",
+        (time.perf_counter() - started) * 1000.0,
+        SLOW_META_BUILD_MS,
+        marker_read_ms=f"{marker_read_ms:.1f}",
+    )
+    return payload
 
 
-def build_payload(*, force_refresh: bool = False) -> dict[str, Any]:
-    global _PAYLOAD_CACHE, _PAYLOAD_CACHE_TS
-    with _PAYLOAD_CACHE_LOCK:
+def _payload_cache_matches_markers(
+    markers: tuple[int | None, int | None],
+    *,
+    windows_sig: tuple[tuple[str, int], ...],
+) -> bool:
+    if _PAYLOAD_CACHE is None:
+        return False
+    baseinfo_batch_completed_at, history_batch_completed_at = markers
+    if baseinfo_batch_completed_at is None and history_batch_completed_at is None:
+        return False
+    return (
+        _PAYLOAD_CACHE_BASEINFO_BATCH_COMPLETED_AT == baseinfo_batch_completed_at
+        and _PAYLOAD_CACHE_HISTORY_BATCH_COMPLETED_AT == history_batch_completed_at
+        and _PAYLOAD_CACHE_WINDOWS_SIGNATURE == windows_sig
+    )
+
+
+def _read_payload_cache_markers() -> tuple[int | None, int | None]:
+    with connect_db() as conn:
+        return fetch_batch_completion_markers(conn)
+
+
+def build_payload(
+    *,
+    force_refresh: bool = False,
+    force_rebuild: bool = False,
+    extra_windows: tuple[WindowDef, ...] | None = None,
+) -> dict[str, Any]:
+    global _PAYLOAD_BUILD_IN_PROGRESS
+    global _PAYLOAD_CACHE
+    global _PAYLOAD_CACHE_BASEINFO_BATCH_COMPLETED_AT
+    global _PAYLOAD_CACHE_HISTORY_BATCH_COMPLETED_AT
+    global _PAYLOAD_CACHE_WINDOWS_SIGNATURE
+    global _PAYLOAD_CACHE_ETAG
+    global _PAYLOAD_CACHE_JSON
+    global _PAYLOAD_CACHE_TS
+
+    windows = merge_windows(extra_windows)
+    windows_sig = windows_signature(windows)
+    markers: tuple[int | None, int | None] | None = None
+    while True:
         now = time.monotonic()
-        if (
-            not force_refresh
-            and _PAYLOAD_CACHE is not None
-            and now - _PAYLOAD_CACHE_TS < PAYLOAD_CACHE_TTL_SEC
-        ):
-            return _PAYLOAD_CACHE
-        payload = _build_payload_uncached()
+        with _PAYLOAD_CACHE_COND:
+            if (
+                not force_refresh
+                and not force_rebuild
+                and _PAYLOAD_CACHE is not None
+                and now - _PAYLOAD_CACHE_TS < PAYLOAD_CACHE_TTL_SEC
+                and _PAYLOAD_CACHE_WINDOWS_SIGNATURE == windows_sig
+            ):
+                return _PAYLOAD_CACHE
+            if (
+                not force_rebuild
+                and markers is not None
+                and _payload_cache_matches_markers(markers, windows_sig=windows_sig)
+            ):
+                return _PAYLOAD_CACHE
+            if _PAYLOAD_BUILD_IN_PROGRESS:
+                _PAYLOAD_CACHE_COND.wait(timeout=1.0)
+                markers = None
+                continue
+
+        if markers is None:
+            markers = _read_payload_cache_markers()
+
+        with _PAYLOAD_CACHE_COND:
+            now = time.monotonic()
+            if (
+                not force_refresh
+                and not force_rebuild
+                and _PAYLOAD_CACHE is not None
+                and now - _PAYLOAD_CACHE_TS < PAYLOAD_CACHE_TTL_SEC
+                and _PAYLOAD_CACHE_WINDOWS_SIGNATURE == windows_sig
+            ):
+                return _PAYLOAD_CACHE
+            if not force_rebuild and _payload_cache_matches_markers(markers, windows_sig=windows_sig):
+                return _PAYLOAD_CACHE
+            if _PAYLOAD_BUILD_IN_PROGRESS:
+                _PAYLOAD_CACHE_COND.wait(timeout=1.0)
+                markers = None
+                continue
+            _PAYLOAD_BUILD_IN_PROGRESS = True
+            break
+
+    build_started = time.perf_counter()
+    perf: dict[str, float] = {}
+    try:
+        payload = _build_payload_uncached(markers=markers, windows=windows, perf=perf)
+        encode_started = time.perf_counter()
+        payload_json = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        perf["json_encode_ms"] = round((time.perf_counter() - encode_started) * 1000.0, 1)
+        payload_etag = _etag_for_bytes(payload_json)
+    except Exception:
+        with _PAYLOAD_CACHE_COND:
+            _PAYLOAD_BUILD_IN_PROGRESS = False
+            _PAYLOAD_CACHE_COND.notify_all()
+        raise
+
+    total_build_ms = (time.perf_counter() - build_started) * 1000.0
+    _log_if_slow(
+        "build_payload",
+        total_build_ms,
+        SLOW_PAYLOAD_BUILD_MS,
+        force_refresh=int(force_refresh),
+        force_rebuild=int(force_rebuild),
+        windows=",".join(key for key, _, _ in windows),
+        items=int(perf.get("item_count", 0)),
+        prepare_schema_ms=f"{perf.get('prepare_schema_ms', 0.0):.1f}",
+        exchange_markers_ms=f"{perf.get('exchange_markers_ms', 0.0):.1f}",
+        marker_read_ms=f"{perf.get('marker_read_ms', 0.0):.1f}",
+        history_sums_ms=f"{perf.get('history_sums_ms', 0.0):.1f}",
+        base_rows_ms=f"{perf.get('base_rows_ms', 0.0):.1f}",
+        item_assembly_ms=f"{perf.get('item_assembly_ms', 0.0):.1f}",
+        json_encode_ms=f"{perf.get('json_encode_ms', 0.0):.1f}",
+    )
+
+    with _PAYLOAD_CACHE_COND:
         _PAYLOAD_CACHE = payload
+        _PAYLOAD_CACHE_JSON = payload_json
         _PAYLOAD_CACHE_TS = time.monotonic()
+        _PAYLOAD_CACHE_BASEINFO_BATCH_COMPLETED_AT = payload.get("baseinfoBatchCompletedAt")
+        _PAYLOAD_CACHE_HISTORY_BATCH_COMPLETED_AT = payload.get("historyBatchCompletedAt")
+        _PAYLOAD_CACHE_WINDOWS_SIGNATURE = windows_sig
+        _PAYLOAD_CACHE_ETAG = payload_etag
+        _PAYLOAD_BUILD_IN_PROGRESS = False
+        _PAYLOAD_CACHE_COND.notify_all()
         return payload
+
+
+def build_payload_json(
+    *,
+    force_refresh: bool = False,
+    force_rebuild: bool = False,
+    extra_windows: tuple[WindowDef, ...] | None = None,
+) -> bytes:
+    payload = build_payload(
+        force_refresh=force_refresh,
+        force_rebuild=force_rebuild,
+        extra_windows=extra_windows,
+    )
+    with _PAYLOAD_CACHE_COND:
+        if payload is _PAYLOAD_CACHE and _PAYLOAD_CACHE_JSON is not None:
+            return _PAYLOAD_CACHE_JSON
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def build_payload_json_and_etag(
+    *,
+    force_refresh: bool = False,
+    force_rebuild: bool = False,
+    extra_windows: tuple[WindowDef, ...] | None = None,
+) -> tuple[bytes, str]:
+    payload = build_payload(
+        force_refresh=force_refresh,
+        force_rebuild=force_rebuild,
+        extra_windows=extra_windows,
+    )
+    with _PAYLOAD_CACHE_COND:
+        if (
+            payload is _PAYLOAD_CACHE
+            and _PAYLOAD_CACHE_JSON is not None
+            and _PAYLOAD_CACHE_ETAG is not None
+        ):
+            return _PAYLOAD_CACHE_JSON, _PAYLOAD_CACHE_ETAG
+    payload_json = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return payload_json, _etag_for_bytes(payload_json)
 
 
 def render_html() -> str:
@@ -959,6 +1613,38 @@ def _render_html(*, static_payload_json: str) -> str:
       color: var(--muted);
       font-size: 11px;
       line-height: 1.2;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }}
+    .choice-state {{
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 10px;
+      line-height: 1;
+    }}
+    .choice-state.state-fresh {{
+      color: var(--success);
+      border-color: rgba(16, 185, 129, 0.35);
+      background: rgba(16, 185, 129, 0.08);
+    }}
+    .choice-state.state-lagging {{
+      color: #f59e0b;
+      border-color: rgba(245, 158, 11, 0.35);
+      background: rgba(245, 158, 11, 0.08);
+    }}
+    .choice-state.state-stale,
+    .choice-state.state-missing {{
+      color: var(--danger);
+      border-color: rgba(239, 68, 68, 0.35);
+      background: rgba(239, 68, 68, 0.08);
+    }}
+    .choice-state.state-unknown {{
+      color: var(--muted);
     }}
     .badge {{
       display: inline-flex;
@@ -1027,7 +1713,8 @@ def _render_html(*, static_payload_json: str) -> str:
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 16px;
-      overflow: visible;
+      overflow: auto;
+      max-height: min(74vh, 1100px);
       box-shadow: 0 20px 50px rgba(0,0,0,0.28);
     }}
     table {{
@@ -1057,6 +1744,14 @@ def _render_html(*, static_payload_json: str) -> str:
     }}
     tbody tr:hover {{
       background: var(--card-strong);
+    }}
+    tbody tr.virtual-spacer:hover {{
+      background: transparent;
+    }}
+    tbody tr.virtual-spacer td {{
+      padding: 0;
+      border-bottom: none;
+      height: 0;
     }}
     .num {{
       font-family: 'Menlo', 'SFMono-Regular', Consolas, monospace;
@@ -1163,6 +1858,16 @@ def _render_html(*, static_payload_json: str) -> str:
     const WINDOW_DAYS_BY_KEY = Object.fromEntries(WINDOWS_META.map(w => [w.key, w.spanMs / 86400000]));
     const STR_COLLATOR = new Intl.Collator(undefined, {{ numeric: true, sensitivity: 'base' }});
     const RENDER_CHUNK_SIZE = 180;
+    const VIRTUALIZE_MIN_ROWS = 160;
+    const VIRTUAL_ROW_HEIGHT = 48;
+    const VIRTUAL_OVERSCAN = 16;
+    const EXCHANGE_STATUS_LABELS = {{
+      fresh: '正常',
+      lagging: '滞后',
+      stale: '过期',
+      missing: '缺失',
+      unknown: '未知',
+    }};
     const toPct = (v) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(4) + '%';
     const toPctFixed = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(digits) + '%';
     const toNum = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : Number(v).toLocaleString(undefined, {{ maximumFractionDigits: digits }});
@@ -1187,14 +1892,19 @@ def _render_html(*, static_payload_json: str) -> str:
     let selectedExchanges = new Set(EXCHANGES_META.map(x => x.key));
     let exchangeCounts = {{}};
     let exchangeUpdatedAt = {{}};
+    let exchangeFreshness = {{}};
     let fixedColumnsApplied = false;
     let renderVersion = 0;
     let scheduledRender = null;
     let pendingRenderPreferFullReplace = false;
+    let pendingRenderResetScroll = false;
     let baseinfoBatchCompletedAt = null;
     let dataLoadInFlight = false;
     let metaPollInFlight = false;
     let autoRefreshHandle = null;
+    let renderedRows = [];
+    let virtualRowHeight = VIRTUAL_ROW_HEIGHT;
+    let virtualRenderHandle = null;
 
     function exchangeLabel(key) {{
       const hit = EXCHANGES_META.find(x => x.key === key);
@@ -1256,6 +1966,19 @@ def _render_html(*, static_payload_json: str) -> str:
       return Number.isFinite(num) && num > 0 ? num : null;
     }}
 
+    function exchangeFreshnessEntry(key) {{
+      return exchangeFreshness[key] || {{ status: 'unknown', lagMs: null, ageMs: null }};
+    }}
+
+    function summarizeExchangeFreshness() {{
+      const counts = {{ fresh: 0, lagging: 0, stale: 0, missing: 0, unknown: 0 }};
+      EXCHANGES_META.forEach(item => {{
+        const status = exchangeFreshnessEntry(item.key).status || 'unknown';
+        counts[status] = (counts[status] || 0) + 1;
+      }});
+      return counts;
+    }}
+
     function renderExchangeChoices() {{
       const group = document.getElementById('exchangeChoices');
       if (!group) return;
@@ -1267,7 +1990,8 @@ def _render_html(*, static_payload_json: str) -> str:
           label: x.label,
           count: exchangeCounts[x.key] || 0,
           checked: selectedExchanges.has(x.key),
-          meta: formatExchangeUpdatedAt(exchangeUpdatedAt[x.key]),
+          updatedLabel: formatExchangeUpdatedAt(exchangeUpdatedAt[x.key]),
+          freshness: exchangeFreshnessEntry(x.key),
         }})),
       ];
       group.innerHTML = items.map(item => `
@@ -1279,7 +2003,7 @@ def _render_html(*, static_payload_json: str) -> str:
                 <span class="choice-text">${'{'}item.label{'}'}</span>
                 <span class="choice-count">${'{'}item.count{'}'}</span>
               </span>
-              ${'{'}item.meta ? `<span class="choice-meta">${'{'}item.meta{'}'}</span>` : ''{'}'}
+              ${'{'}item.key === 'all' ? '' : `<span class="choice-meta"><span>${'{'}item.updatedLabel || '—'{'}'}</span><span class="choice-state state-${'{'}item.freshness.status || 'unknown'{'}'}">${'{'}EXCHANGE_STATUS_LABELS[item.freshness.status] || EXCHANGE_STATUS_LABELS.unknown{'}'}</span></span>`{'}'}
             </span>
           </label>
         </div>
@@ -1305,7 +2029,7 @@ def _render_html(*, static_payload_json: str) -> str:
         }}
       }}
       renderExchangeChoices();
-      render();
+      render({{ resetScroll: true }});
     }}
 
     function applyFixedColumnWidths() {{
@@ -1382,7 +2106,9 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
       exchangeCounts = counts;
       exchangeUpdatedAt = updatedMap;
-      footer.textContent = '历史数据 1 小时更新一次，其他数据 10 分钟更新一次';
+      exchangeFreshness = payload.exchangeFreshness || {{}};
+      const freshnessCounts = summarizeExchangeFreshness();
+      footer.textContent = `历史数据 1 小时更新一次，其他数据 10 分钟更新一次 · 交易所状态：正常 ${'{'}freshnessCounts.fresh || 0{'}'} / 滞后 ${'{'}freshnessCounts.lagging || 0{'}'} / 过期 ${'{'}freshnessCounts.stale || 0{'}'} / 缺失 ${'{'}freshnessCounts.missing || 0{'}'}`;
       renderExchangeChoices();
     }}
 
@@ -1443,26 +2169,69 @@ def _render_html(*, static_payload_json: str) -> str:
       `;
     }}
 
-    function appendRowsInChunks(body, rows, version, offset = 0) {{
-      if (version !== renderVersion) return;
-      const chunk = rows.slice(offset, offset + RENDER_CHUNK_SIZE);
-      if (!chunk.length) {{
+    function renderVirtualRows(body, rows, {{ resetScroll = false }} = {{}}) {{
+      const viewport = document.querySelector('.table-wrap');
+      if (!viewport) {{
+        body.innerHTML = rows.map(renderRow).join('');
         if (!fixedColumnsApplied) applyFixedColumnWidths();
         return;
       }}
-      body.insertAdjacentHTML('beforeend', chunk.map(renderRow).join(''));
-      const nextOffset = offset + chunk.length;
-      if (nextOffset >= rows.length) {{
-        if (!fixedColumnsApplied) applyFixedColumnWidths();
-        return;
+      if (resetScroll) viewport.scrollTop = 0;
+      const totalRows = rows.length;
+      const viewportHeight = Math.max(240, viewport.clientHeight || 0);
+      const visibleCount = Math.max(1, Math.ceil(viewportHeight / virtualRowHeight));
+      const start = Math.max(0, Math.floor(viewport.scrollTop / virtualRowHeight) - VIRTUAL_OVERSCAN);
+      const end = Math.min(totalRows, start + visibleCount + VIRTUAL_OVERSCAN * 2);
+      const topHeight = start * virtualRowHeight;
+      const bottomHeight = Math.max(0, (totalRows - end) * virtualRowHeight);
+      let html = '';
+      if (topHeight > 0) {{
+        html += `<tr class="virtual-spacer" aria-hidden="true"><td colspan="99" style="height:${'{'}topHeight{'}'}px"></td></tr>`;
       }}
-      requestAnimationFrame(() => appendRowsInChunks(body, rows, version, nextOffset));
+      html += rows.slice(start, end).map(renderRow).join('');
+      if (bottomHeight > 0) {{
+        html += `<tr class="virtual-spacer" aria-hidden="true"><td colspan="99" style="height:${'{'}bottomHeight{'}'}px"></td></tr>`;
+      }}
+      body.innerHTML = html;
+      const sampleRow = body.querySelector('tr:not(.virtual-spacer)');
+      if (sampleRow) {{
+        const measured = Math.round(sampleRow.getBoundingClientRect().height);
+        if (measured > 16 && Math.abs(measured - virtualRowHeight) >= 2) {{
+          virtualRowHeight = measured;
+          requestAnimationFrame(() => renderVirtualRows(body, rows));
+          return;
+        }}
+      }}
+      if (!fixedColumnsApplied) applyFixedColumnWidths();
     }}
 
-    function renderNow({{ preferFullReplace = false }} = {{}}) {{
+    function scheduleVirtualRows() {{
+      if (virtualRenderHandle) cancelAnimationFrame(virtualRenderHandle);
+      virtualRenderHandle = requestAnimationFrame(() => {{
+        virtualRenderHandle = null;
+        const body = document.getElementById('table-body');
+        if (!body || renderedRows.length <= VIRTUALIZE_MIN_ROWS) return;
+        renderVirtualRows(body, renderedRows);
+      }});
+    }}
+
+    function bindTableViewport() {{
+      const viewport = document.querySelector('.table-wrap');
+      if (!viewport || viewport.dataset.virtualBound === '1') return;
+      viewport.dataset.virtualBound = '1';
+      viewport.addEventListener('scroll', () => {{
+        if (renderedRows.length <= VIRTUALIZE_MIN_ROWS) return;
+        scheduleVirtualRows();
+      }});
+      window.addEventListener('resize', () => {{
+        fixedColumnsApplied = false;
+        render();
+      }});
+    }}
+
+    function renderNow({{ preferFullReplace = false, resetScroll = false }} = {{}}) {{
       const body = document.getElementById('table-body');
       renderVersion += 1;
-      const version = renderVersion;
       const rawQuery = document.getElementById('searchBox').value.trim().toUpperCase();
       const exactSearch = rawQuery.endsWith('/');
       const q = exactSearch ? rawQuery.slice(0, -1).trim() : rawQuery;
@@ -1509,30 +2278,34 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
 
       if (!sorted.length) {{
+        renderedRows = [];
         body.innerHTML = '<tr><td colspan="99" class="dim">暂无数据：请先运行采集脚本写入 funding.db</td></tr>';
         updateSortIndicators();
         return;
       }}
 
       updateSortIndicators();
-      if (preferFullReplace) {{
-        fixedColumnsApplied = false;
+      renderedRows = sorted;
+      fixedColumnsApplied = false;
+      if (sorted.length <= VIRTUALIZE_MIN_ROWS) {{
         body.innerHTML = sorted.map(renderRow).join('');
         applyFixedColumnWidths();
         return;
       }}
-      body.innerHTML = '';
-      appendRowsInChunks(body, sorted, version);
+      renderVirtualRows(body, sorted, {{ resetScroll }});
     }}
 
-    function render({{ preferFullReplace = false }} = {{}}) {{
+    function render({{ preferFullReplace = false, resetScroll = false }} = {{}}) {{
       pendingRenderPreferFullReplace = pendingRenderPreferFullReplace || preferFullReplace;
+      pendingRenderResetScroll = pendingRenderResetScroll || resetScroll;
       if (scheduledRender) cancelAnimationFrame(scheduledRender);
       scheduledRender = requestAnimationFrame(() => {{
         const useFullReplace = pendingRenderPreferFullReplace;
+        const useResetScroll = pendingRenderResetScroll;
         pendingRenderPreferFullReplace = false;
+        pendingRenderResetScroll = false;
         scheduledRender = null;
-        renderNow({{ preferFullReplace: useFullReplace }});
+        renderNow({{ preferFullReplace: useFullReplace, resetScroll: useResetScroll }});
       }});
     }}
 
@@ -1568,7 +2341,7 @@ def _render_html(*, static_payload_json: str) -> str:
     let searchDebounce = null;
     document.getElementById('searchBox').addEventListener('input', () => {{
       if (searchDebounce) clearTimeout(searchDebounce);
-      searchDebounce = setTimeout(render, 80);
+      searchDebounce = setTimeout(() => render({{ resetScroll: true }}), 80);
     }});
 
     const oiFilter = document.getElementById('oiFilter');
@@ -1580,7 +2353,7 @@ def _render_html(*, static_payload_json: str) -> str:
     oiFilter.addEventListener('input', (e) => {{
       oiThresholdIdx = Number(e.target.value) || 0;
       updateOiLabel();
-      render();
+      render({{ resetScroll: true }});
     }});
     updateOiLabel();
 
@@ -1594,11 +2367,12 @@ def _render_html(*, static_payload_json: str) -> str:
           sortKey = key;
           sortDir = (key === 'symbol' || key === 'exchange') ? 'asc' : 'desc';
         }}
-        render();
+        render({{ resetScroll: true }});
       }});
     }});
     updateSortIndicators();
 
+    bindTableViewport();
     startAutoRefresh();
     load().catch(err => {{
       document.getElementById('table-body').innerHTML = `<tr><td colspan="99" class="dim">加载失败：${'{'}err.message{'}'}</td></tr>`;
@@ -1616,54 +2390,143 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except CLIENT_DISCONNECT_ERRORS:
             self.close_connection = True
 
-    def _send_bytes(self, data: bytes, *, status: int, content_type: str, cache_control: str | None = None) -> None:
+    def _client_accepts_gzip(self) -> bool:
+        return "gzip" in str(self.headers.get("Accept-Encoding") or "").lower()
+
+    def _send_bytes(
+        self,
+        data: bytes,
+        *,
+        status: int,
+        content_type: str,
+        cache_control: str | None = None,
+        etag: str | None = None,
+        allow_compression: bool = True,
+    ) -> None:
         try:
+            if etag is not None and str(self.headers.get("If-None-Match") or "").strip() == etag:
+                self.send_response(304)
+                self.send_header("Content-Type", content_type)
+                if cache_control is not None:
+                    self.send_header("Cache-Control", cache_control)
+                self.send_header("ETag", etag)
+                if allow_compression:
+                    self.send_header("Vary", "Accept-Encoding")
+                self.end_headers()
+                self._last_response_status = 304
+                self._last_response_size = 0
+                self._last_response_compressed = False
+                return
+
+            compressed = False
+            body = data
+            if allow_compression and len(data) >= GZIP_MIN_BYTES and self._client_accepts_gzip():
+                body = gzip.compress(data, compresslevel=GZIP_COMPRESSLEVEL)
+                compressed = True
+
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             if cache_control is not None:
                 self.send_header("Cache-Control", cache_control)
-            self.send_header("Content-Length", str(len(data)))
+            if etag is not None:
+                self.send_header("ETag", etag)
+            if allow_compression:
+                self.send_header("Vary", "Accept-Encoding")
+            if compressed:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(data)
+            self.wfile.write(body)
+            self._last_response_status = status
+            self._last_response_size = len(body)
+            self._last_response_compressed = compressed
         except CLIENT_DISCONNECT_ERRORS:
             self.close_connection = True
 
-    def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+    def _send_json(self, payload: dict[str, Any], status: int = 200, *, etag: str | None = None) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_json_bytes(data, status=status, etag=etag)
+
+    def _send_json_bytes(self, data: bytes, *, status: int = 200, etag: str | None = None) -> None:
         self._send_bytes(
             data,
             status=status,
             content_type="application/json; charset=utf-8",
             cache_control="no-store",
+            etag=etag,
         )
 
     def _send_html(self, content: str) -> None:
         data = content.encode("utf-8")
-        self._send_bytes(data, status=200, content_type="text/html; charset=utf-8")
+        self._send_bytes(
+            data,
+            status=200,
+            content_type="text/html; charset=utf-8",
+            cache_control="no-cache",
+            etag=_etag_for_bytes(data),
+        )
+
+    def _log_http_request(
+        self,
+        *,
+        path: str,
+        started_at: float,
+        threshold_ms: float,
+        force_refresh: bool = False,
+        force_rebuild: bool = False,
+    ) -> None:
+        _log_if_slow(
+            "http_request",
+            (time.perf_counter() - started_at) * 1000.0,
+            threshold_ms,
+            path=path,
+            status=getattr(self, "_last_response_status", 0),
+            bytes=getattr(self, "_last_response_size", 0),
+            gzip=int(bool(getattr(self, "_last_response_compressed", False))),
+            refresh=int(force_refresh),
+            rebuild=int(force_rebuild),
+        )
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query, keep_blank_values=True)
         if path in ("/", "/index.html"):
+            request_started = time.perf_counter()
             self._send_html(render_html())
+            self._log_http_request(path=path, started_at=request_started, threshold_ms=SLOW_HTTP_META_MS)
             return
         if path == "/api/data":
+            request_started = time.perf_counter()
             try:
                 force_refresh = query.get("refresh", ["0"])[0] not in ("", "0", "false", "False")
-                payload = build_payload(force_refresh=force_refresh)
+                force_rebuild = query.get("rebuild", ["0"])[0] not in ("", "0", "false", "False")
+                payload_json, payload_etag = build_payload_json_and_etag(
+                    force_refresh=force_refresh,
+                    force_rebuild=force_rebuild,
+                )
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"error": str(exc)}, status=500)
                 return
-            self._send_json(payload)
+            self._send_json_bytes(payload_json, etag=payload_etag)
+            self._log_http_request(
+                path=path,
+                started_at=request_started,
+                threshold_ms=SLOW_HTTP_DATA_MS,
+                force_refresh=force_refresh,
+                force_rebuild=force_rebuild,
+            )
             return
         if path == "/api/meta":
+            request_started = time.perf_counter()
             try:
                 payload = build_meta_payload()
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"error": str(exc)}, status=500)
                 return
-            self._send_json(payload)
+            payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send_json_bytes(payload_bytes, etag=_etag_for_bytes(payload_bytes))
+            self._log_http_request(path=path, started_at=request_started, threshold_ms=SLOW_HTTP_META_MS)
             return
 
         self._send_bytes(b"", status=404, content_type="text/plain; charset=utf-8")
@@ -1673,6 +2536,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def write_static_file(output: Path) -> None:
+    initialize_dashboard_runtime(apply_legacy_migrations=True)
     payload = build_payload(force_refresh=True)
     html = render_html_static(payload)
     output.write_text(html, encoding="utf-8")
@@ -1697,6 +2561,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    initialize_dashboard_runtime(apply_legacy_migrations=True)
     if args.static:
         output = Path(args.output)
         write_static_file(output)

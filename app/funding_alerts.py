@@ -9,7 +9,6 @@ import hashlib
 import hmac
 import json
 import os
-import sqlite3
 import sys
 import time
 from dataclasses import dataclass
@@ -22,21 +21,16 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.allfunding_dashboard import build_payload
-from core.common_funding import tune_sqlite_connection
-from core.funding_exchanges import dashboard_exchange_meta
+from app.allfunding_dashboard import build_payload, initialize_dashboard_runtime
 
 DEFAULT_ALERT_CONFIG = ROOT / "config" / "alerts.json"
 ALERT_CONFIG_ENV = "FUNDING_ALERT_CONFIG"
-FUNDING_DB_PATH_ENV = "FUNDING_DB_PATH"
-DB_PATH = Path(os.getenv(FUNDING_DB_PATH_ENV) or (ROOT / "funding.db")).expanduser().resolve()
 H4_WINDOW_MS = 4 * 60 * 60 * 1000
-EXCHANGE_META = dashboard_exchange_meta(ROOT)
+H4_ALERT_WINDOW = (("h4", H4_WINDOW_MS, "4 小时"),)
 
 
 @dataclass(frozen=True)
 class AlertHit:
-    dedupe_keys: tuple[str, ...]
     exchange: str
     symbol: str
     latest_value: float | None
@@ -57,69 +51,6 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"配置格式错误（需为 JSON object）: {path}")
     return data
-
-
-def resolve_state_path(config: dict[str, Any], config_path: Path) -> Path:
-    raw = str(config.get("state_path") or "logs/alert_state.json").strip()
-    path = Path(raw)
-    if not path.is_absolute():
-        path = (ROOT / path).resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def load_state(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"sent": {}}
-    try:
-        data = load_json(path)
-    except Exception:
-        return {"sent": {}}
-    sent = data.get("sent")
-    if not isinstance(sent, dict):
-        sent = {}
-    return {"sent": sent}
-
-
-def save_state(path: Path, state: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(state, fp, ensure_ascii=False, indent=2, sort_keys=True)
-
-
-def connect_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    tune_sqlite_connection(conn)
-    return conn
-
-
-def fetch_h4_sums(now_ms: int) -> dict[tuple[str, str], float | None]:
-    result: dict[tuple[str, str], float | None] = {}
-    lower = now_ms - H4_WINDOW_MS
-    with connect_db() as conn:
-        for exchange_key, meta in EXCHANGE_META.items():
-            history_table = str(meta["history_table"])
-            try:
-                rows = conn.execute(
-                    f"""
-                    SELECT symbol,
-                           MIN(fundingTime) AS oldestFundingTime,
-                           COALESCE(SUM(CASE WHEN fundingTime >= ? AND fundingTime <= ? THEN CAST(fundingRate AS REAL) ELSE 0 END), 0) AS h4
-                    FROM {history_table}
-                    WHERE fundingTime <= ?
-                    GROUP BY symbol
-                    """,
-                    (lower, now_ms, now_ms),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
-            for row in rows:
-                oldest = row["oldestFundingTime"]
-                oldest_ms = int(oldest) if oldest is not None else None
-                mature = oldest_ms is not None and oldest_ms <= lower
-                result[(exchange_key, str(row["symbol"]))] = float(row["h4"]) if mature else None
-    return result
 
 
 def parse_threshold(config: dict[str, Any], *keys: str) -> float | None:
@@ -144,9 +75,7 @@ def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertH
         oi_min_musd_value = max(0.0, float(oi_min_musd)) if oi_min_musd is not None else None
     except (TypeError, ValueError):
         oi_min_musd_value = None
-    generated_at = int(payload.get("generatedAt") or time.time() * 1000)
     h4_enabled = h4_threshold_gte_pct is not None or h4_threshold_lte_pct is not None
-    h4_sums = fetch_h4_sums(generated_at) if h4_enabled else {}
 
     hits: list[AlertHit] = []
     for item in payload.get("items", []):
@@ -171,28 +100,28 @@ def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertH
 
         latest = item.get("lastFundingRate")
         latest_value = float(latest) if isinstance(latest, (int, float)) else None
-        h4_raw = h4_sums.get((exchange_key, symbol)) if h4_enabled else None
+        sums = item.get("sums")
+        h4_raw = sums.get("h4") if h4_enabled and isinstance(sums, dict) else None
         h4_value = float(h4_raw) if isinstance(h4_raw, (int, float)) else None
 
-        dedupe_keys: list[str] = []
+        matched = False
         if latest_value is not None:
             latest_pct = latest_value * 100.0
             if latest_threshold_gte_pct is not None and latest_pct >= latest_threshold_gte_pct:
-                dedupe_keys.append(f"{exchange}:{symbol}:latest_gte")
+                matched = True
             if latest_threshold_lte_pct is not None and latest_pct <= latest_threshold_lte_pct:
-                dedupe_keys.append(f"{exchange}:{symbol}:latest_lte")
+                matched = True
 
         if h4_value is not None:
             h4_pct = h4_value * 100.0
             if h4_threshold_gte_pct is not None and h4_pct >= h4_threshold_gte_pct:
-                dedupe_keys.append(f"{exchange}:{symbol}:h4_gte")
+                matched = True
             if h4_threshold_lte_pct is not None and h4_pct <= h4_threshold_lte_pct:
-                dedupe_keys.append(f"{exchange}:{symbol}:h4_lte")
+                matched = True
 
-        if dedupe_keys:
+        if matched:
             hits.append(
                 AlertHit(
-                    dedupe_keys=tuple(dedupe_keys),
                     exchange=exchange,
                     symbol=symbol,
                     latest_value=latest_value,
@@ -204,44 +133,6 @@ def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertH
 
     hits.sort(key=lambda item: (item.exchange, -(abs(item.latest_value) if item.latest_value is not None else -1.0), item.symbol))
     return hits
-
-
-def filter_hits_by_cooldown(
-    hits: list[AlertHit],
-    state: dict[str, Any],
-    *,
-    cooldown_minutes: int,
-    force: bool,
-) -> list[AlertHit]:
-    if force:
-        return hits
-    sent = state.setdefault("sent", {})
-    now_ms = int(time.time() * 1000)
-    cooldown_ms = max(0, cooldown_minutes) * 60 * 1000
-    due: list[AlertHit] = []
-    for hit in hits:
-        due_keys: list[str] = []
-        for key in hit.dedupe_keys:
-            last_sent = sent.get(key)
-            try:
-                last_sent_ms = int(last_sent)
-            except (TypeError, ValueError):
-                last_sent_ms = None
-            if last_sent_ms is None or now_ms - last_sent_ms >= cooldown_ms:
-                due_keys.append(key)
-        if due_keys:
-            due.append(
-                AlertHit(
-                    dedupe_keys=tuple(due_keys),
-                    exchange=hit.exchange,
-                    symbol=hit.symbol,
-                    latest_value=hit.latest_value,
-                    h4_value=hit.h4_value,
-                    interval_hours=hit.interval_hours,
-                    open_interest_musd=hit.open_interest_musd,
-                )
-            )
-    return due
 
 
 def fmt_pct(value: float | None) -> str:
@@ -376,7 +267,6 @@ def parse_args() -> argparse.Namespace:
         help="Alert config path (defaults to FUNDING_ALERT_CONFIG or config/alerts.json)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print alerts without sending")
-    parser.add_argument("--force", action="store_true", help="Ignore cooldown and send immediately")
     return parser.parse_args()
 
 
@@ -387,26 +277,23 @@ def main() -> None:
     if not config.get("enabled"):
         return
 
-    state_path = resolve_state_path(config, config_path)
-    state = load_state(state_path)
-    cooldown_minutes = int(config.get("cooldown_minutes") or 120)
+    initialize_dashboard_runtime(apply_legacy_migrations=True)
     max_items = max(1, int(config.get("max_items_per_run") or 20))
+    h4_enabled = (
+        parse_threshold(config, "h4_pct_gte", "h4_abs_pct_gte") is not None
+        or parse_threshold(config, "h4_pct_lte", "h4_abs_pct_lte") is not None
+    )
 
-    payload = build_payload(force_refresh=True)
+    payload = build_payload(
+        force_refresh=True,
+        extra_windows=H4_ALERT_WINDOW if h4_enabled else None,
+    )
     hits = collect_hits(payload, config)
-    due_hits = filter_hits_by_cooldown(hits, state, cooldown_minutes=cooldown_minutes, force=args.force)
-    if not due_hits:
+    if not hits:
         return
 
-    message = build_message(due_hits, payload, max_items=max_items)
-    sent = notify(message, config, dry_run=args.dry_run)
-    if sent:
-        sent_state = state.setdefault("sent", {})
-        now_ms = int(time.time() * 1000)
-        for hit in due_hits:
-            for key in hit.dedupe_keys:
-                sent_state[key] = now_ms
-        save_state(state_path, state)
+    message = build_message(hits, payload, max_items=max_items)
+    notify(message, config, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
