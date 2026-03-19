@@ -13,7 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -49,6 +49,8 @@ _PAYLOAD_CACHE: dict[str, Any] | None = None
 _PAYLOAD_CACHE_TS = 0.0
 
 APP_META_TABLE = "app_meta"
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+BASEINFO_BATCH_COMPLETED_AT_KEY = "baseinfo_batch_completed_at"
 
 
 def _to_number(val: Any) -> float | None:
@@ -140,6 +142,21 @@ def fetch_exchange_baseinfo_completed_at(conn: sqlite3.Connection) -> dict[str, 
         if ts is not None:
             out[exchange] = ts
     return out
+
+
+def fetch_baseinfo_batch_completed_at(conn: sqlite3.Connection) -> int | None:
+    if not _table_exists(conn, APP_META_TABLE):
+        return None
+    row = conn.execute(
+        f"SELECT value, updated_at FROM {APP_META_TABLE} WHERE key=? LIMIT 1",
+        (BASEINFO_BATCH_COMPLETED_AT_KEY,),
+    ).fetchone()
+    if row is None:
+        return None
+    ts = _to_int(row["value"])
+    if ts is None:
+        ts = _to_int(row["updated_at"])
+    return ts
 
 
 def _normalize_legacy_bps_columns(
@@ -654,6 +671,7 @@ def _build_payload_uncached() -> dict[str, Any]:
     with connect_db() as conn:
         prepare_schema(conn)
         exchange_updated_at = fetch_exchange_baseinfo_completed_at(conn)
+        baseinfo_batch_completed_at = fetch_baseinfo_batch_completed_at(conn)
         fallback_exchange_updated_at: dict[str, int] = {}
         for exchange, meta in EXCHANGES.items():
             info_table = _INFO_TABLE_BY_EXCHANGE.get(exchange)
@@ -707,11 +725,20 @@ def _build_payload_uncached() -> dict[str, Any]:
 
     return {
         "generatedAt": now_ms,
+        "baseinfoBatchCompletedAt": baseinfo_batch_completed_at,
         "windows": [{"key": key, "label": label, "spanMs": span} for key, span, label in WINDOWS],
         "exchanges": [{"key": k, "label": str(v["label"])} for k, v in EXCHANGES.items()],
         "exchangeUpdatedAt": exchange_updated_at,
         "items": items,
     }
+
+
+def build_meta_payload() -> dict[str, Any]:
+    with connect_db() as conn:
+        return {
+            "generatedAt": int(time.time() * 1000),
+            "baseinfoBatchCompletedAt": fetch_baseinfo_batch_completed_at(conn),
+        }
 
 
 def build_payload(*, force_refresh: bool = False) -> dict[str, Any]:
@@ -1151,6 +1178,7 @@ def _render_html(*, static_payload_json: str) -> str:
     const classFor = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim';
 
     const OI_THRESHOLDS = [0, 1, 3, 5, 10, 30, 50, 100]; // million USDT
+    const META_POLL_INTERVAL_MS = 60000;
 
     let dataCache = [];
     let sortKey = 'symbol';
@@ -1162,6 +1190,11 @@ def _render_html(*, static_payload_json: str) -> str:
     let fixedColumnsApplied = false;
     let renderVersion = 0;
     let scheduledRender = null;
+    let pendingRenderPreferFullReplace = false;
+    let baseinfoBatchCompletedAt = null;
+    let dataLoadInFlight = false;
+    let metaPollInFlight = false;
+    let autoRefreshHandle = null;
 
     function exchangeLabel(key) {{
       const hit = EXCHANGES_META.find(x => x.key === key);
@@ -1216,6 +1249,11 @@ def _render_html(*, static_payload_json: str) -> str:
       const hh = String(d.getHours()).padStart(2, '0');
       const mi = String(d.getMinutes()).padStart(2, '0');
       return `${'{'}mm{'}'}${'{'}dd{'}'} ${'{'}hh{'}'}:${'{'}mi{'}'}`;
+    }}
+
+    function normalizeTimestamp(ts) {{
+      const num = Number(ts);
+      return Number.isFinite(num) && num > 0 ? num : null;
     }}
 
     function renderExchangeChoices() {{
@@ -1304,19 +1342,29 @@ def _render_html(*, static_payload_json: str) -> str:
       fixedColumnsApplied = true;
     }}
 
-    async function load() {{
+    function applyPayload(payload, {{ preferFullReplace = false }} = {{}}) {{
+      dataCache = prepareItems(payload.items || []);
+      baseinfoBatchCompletedAt = normalizeTimestamp(payload.baseinfoBatchCompletedAt);
+      updateMeta(payload);
+      render({{ preferFullReplace }});
+    }}
+
+    async function load({{ forceRefresh = false, preferFullReplace = false }} = {{}}) {{
       if (STATIC_PAYLOAD) {{
-        dataCache = prepareItems(STATIC_PAYLOAD.items || []);
-        updateMeta(STATIC_PAYLOAD);
-        render();
+        applyPayload(STATIC_PAYLOAD, {{ preferFullReplace }});
         return;
       }}
-      const res = await fetch('/api/data');
-      if (!res.ok) throw new Error('数据获取失败');
-      const payload = await res.json();
-      dataCache = prepareItems(payload.items || []);
-      updateMeta(payload);
-      render();
+      if (dataLoadInFlight) return;
+      dataLoadInFlight = true;
+      try {{
+        const url = forceRefresh ? '/api/data?refresh=1' : '/api/data';
+        const res = await fetch(url, {{ cache: 'no-store' }});
+        if (!res.ok) throw new Error('数据获取失败');
+        const payload = await res.json();
+        applyPayload(payload, {{ preferFullReplace }});
+      }} finally {{
+        dataLoadInFlight = false;
+      }}
     }}
 
     function updateMeta(payload) {{
@@ -1411,7 +1459,7 @@ def _render_html(*, static_payload_json: str) -> str:
       requestAnimationFrame(() => appendRowsInChunks(body, rows, version, nextOffset));
     }}
 
-    function renderNow() {{
+    function renderNow({{ preferFullReplace = false }} = {{}}) {{
       const body = document.getElementById('table-body');
       renderVersion += 1;
       const version = renderVersion;
@@ -1467,15 +1515,53 @@ def _render_html(*, static_payload_json: str) -> str:
       }}
 
       updateSortIndicators();
+      if (preferFullReplace) {{
+        fixedColumnsApplied = false;
+        body.innerHTML = sorted.map(renderRow).join('');
+        applyFixedColumnWidths();
+        return;
+      }}
       body.innerHTML = '';
       appendRowsInChunks(body, sorted, version);
     }}
 
-    function render() {{
+    function render({{ preferFullReplace = false }} = {{}}) {{
+      pendingRenderPreferFullReplace = pendingRenderPreferFullReplace || preferFullReplace;
       if (scheduledRender) cancelAnimationFrame(scheduledRender);
       scheduledRender = requestAnimationFrame(() => {{
+        const useFullReplace = pendingRenderPreferFullReplace;
+        pendingRenderPreferFullReplace = false;
         scheduledRender = null;
-        renderNow();
+        renderNow({{ preferFullReplace: useFullReplace }});
+      }});
+    }}
+
+    async function pollMetaAndRefresh() {{
+      if (STATIC_PAYLOAD || document.hidden || metaPollInFlight) return;
+      metaPollInFlight = true;
+      try {{
+        const res = await fetch('/api/meta', {{ cache: 'no-store' }});
+        if (!res.ok) return;
+        const payload = await res.json();
+        const nextCompletedAt = normalizeTimestamp(payload.baseinfoBatchCompletedAt);
+        if (nextCompletedAt == null || nextCompletedAt === baseinfoBatchCompletedAt) return;
+        await load({{ forceRefresh: true, preferFullReplace: true }});
+      }} catch (_err) {{
+        return;
+      }} finally {{
+        metaPollInFlight = false;
+      }}
+    }}
+
+    function startAutoRefresh() {{
+      if (STATIC_PAYLOAD || autoRefreshHandle) return;
+      autoRefreshHandle = setInterval(() => {{
+        pollMetaAndRefresh();
+      }}, META_POLL_INTERVAL_MS);
+      document.addEventListener('visibilitychange', () => {{
+        if (!document.hidden) {{
+          pollMetaAndRefresh();
+        }}
       }});
     }}
 
@@ -1513,6 +1599,7 @@ def _render_html(*, static_payload_json: str) -> str:
     }});
     updateSortIndicators();
 
+    startAutoRefresh();
     load().catch(err => {{
       document.getElementById('table-body').innerHTML = `<tr><td colspan="99" class="dim">加载失败：${'{'}err.message{'}'}</td></tr>`;
     }});
@@ -1523,40 +1610,63 @@ def _render_html(*, static_payload_json: str) -> str:
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
+
+    def _send_bytes(self, data: bytes, *, status: int, content_type: str, cache_control: str | None = None) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            if cache_control is not None:
+                self.send_header("Cache-Control", cache_control)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
+
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self._send_bytes(
+            data,
+            status=status,
+            content_type="application/json; charset=utf-8",
+            cache_control="no-store",
+        )
 
     def _send_html(self, content: str) -> None:
         data = content.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self._send_bytes(data, status=200, content_type="text/html; charset=utf-8")
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        query = parse_qs(parsed.query, keep_blank_values=True)
         if path in ("/", "/index.html"):
             self._send_html(render_html())
             return
         if path == "/api/data":
             try:
-                payload = build_payload()
+                force_refresh = query.get("refresh", ["0"])[0] not in ("", "0", "false", "False")
+                payload = build_payload(force_refresh=force_refresh)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=500)
+                return
+            self._send_json(payload)
+            return
+        if path == "/api/meta":
+            try:
+                payload = build_meta_payload()
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"error": str(exc)}, status=500)
                 return
             self._send_json(payload)
             return
 
-        self.send_response(404)
-        self.end_headers()
+        self._send_bytes(b"", status=404, content_type="text/plain; charset=utf-8")
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         return

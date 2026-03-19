@@ -33,6 +33,7 @@ BASE_URL = os.getenv("GATE_BASE_URL", "https://api.gateio.ws").rstrip("/")
 FUNDING_HISTORY_PATH = "/api/v4/futures/usdt/funding_rate"
 REQUEST_TIMEOUT = 20
 MAX_HTTP_ATTEMPTS = 4
+MAX_FAILED_SYMBOLS_IN_LOG = 10
 
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT_DIR / "funding.db")).expanduser().resolve()
 INFO_TABLE = "gate_funding_baseinfo"
@@ -42,26 +43,61 @@ DAYS_TO_FETCH = 30
 DAYS_TO_KEEP = 60
 MAX_RECORDS = 1000
 
-WINDOW_SECONDS = 60
-WINDOW_CAPACITY = 600
+WINDOW_SECONDS = float(os.getenv("GATE_HISTORY_RATE_LIMIT_WINDOW_SECONDS", "1"))
+WINDOW_CAPACITY = int(os.getenv("GATE_HISTORY_RATE_LIMIT_CAPACITY", "4"))
+
+
+class GateRequestError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def gate_retry_delay_seconds(resp: requests.Response | None, attempt: int) -> float:
+    if resp is not None:
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                seconds = float(retry_after)
+            except ValueError:
+                seconds = 0.0
+            if seconds > 0:
+                return min(seconds, 60.0)
+    return min(max(2.0, 3.0 * attempt), 30.0)
 
 
 def gate_get(session: requests.Session, path: str, *, params: dict[str, Any] | None = None) -> Any:
     url = f"{BASE_URL}{path}"
-    last_exc: Exception | None = None
+    last_exc: GateRequestError | None = None
     for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
         try:
             resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            if resp.status_code >= 500:
-                raise RuntimeError(f"{path} http {resp.status_code}")
-            resp.raise_for_status()
-            return resp.json()
-        except (RequestException, RuntimeError) as exc:
-            last_exc = exc
-            if attempt >= MAX_HTTP_ATTEMPTS:
+        except RequestException as exc:
+            last_exc = GateRequestError(f"{path} network error: {exc}", retryable=True)
+        else:
+            if resp.status_code == 429:
+                last_exc = GateRequestError(f"{path} http 429", retryable=True)
+                if attempt < MAX_HTTP_ATTEMPTS:
+                    time.sleep(gate_retry_delay_seconds(resp, attempt))
+                    continue
                 break
-            time.sleep(min(1.0 * attempt, 3.0))
-    raise RuntimeError(f"Gate 请求失败: {path}, err={last_exc}") from last_exc
+            if resp.status_code >= 500:
+                last_exc = GateRequestError(f"{path} http {resp.status_code}", retryable=True)
+            elif resp.status_code >= 400:
+                last_exc = GateRequestError(f"{path} http {resp.status_code}", retryable=False)
+            else:
+                try:
+                    return resp.json()
+                except ValueError as exc:
+                    last_exc = GateRequestError(f"{path} invalid json: {exc}", retryable=True)
+
+        if attempt >= MAX_HTTP_ATTEMPTS or (last_exc is not None and not last_exc.retryable):
+            break
+        time.sleep(gate_retry_delay_seconds(None, attempt))
+    raise GateRequestError(
+        f"Gate 请求失败: {path}, err={last_exc}",
+        retryable=bool(last_exc.retryable if last_exc is not None else True),
+    ) from last_exc
 
 
 def fetch_symbol_history(
@@ -72,7 +108,7 @@ def fetch_symbol_history(
     limiter.acquire()
     data = gate_get(session, FUNDING_HISTORY_PATH, params={"contract": symbol, "limit": MAX_RECORDS})
     if not isinstance(data, list):
-        raise RuntimeError(f"{symbol} funding history 返回格式异常（非 list）")
+        raise GateRequestError(f"{symbol} funding history 返回格式异常（非 list）", retryable=False)
     out = [item for item in data if isinstance(item, dict)]
     out.sort(key=lambda x: normalize_ts_to_ms(x.get("t") or x.get("time")) or 0)
     return out
@@ -122,11 +158,13 @@ def main() -> None:
         ensure_history_table(conn, HISTORY_TABLE)
         symbols = load_symbols(conn, INFO_TABLE)
         collector_log_start("Gate", "history", detail=f"{len(symbols)} 个交易对，近 {DAYS_TO_FETCH} 天资金费率")
+        failed_symbols: list[str] = []
 
         for idx, symbol in enumerate(symbols, 1):
             try:
                 records = fetch_symbol_history(session, limiter, symbol)
             except Exception as exc:  # noqa: BLE001
+                failed_symbols.append(symbol)
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] {symbol} 获取失败：{exc}")
                 continue
 
@@ -141,6 +179,17 @@ def main() -> None:
             delete_older_than(conn, HISTORY_TABLE, cutoff_ms, [symbol])
             conn.commit()
             collector_log_progress("Gate", "history", detail=f"{symbol} 入库 {inserted} 条", current=idx, total=len(symbols))
+
+    if failed_symbols:
+        preview = ", ".join(failed_symbols[:MAX_FAILED_SYMBOLS_IN_LOG])
+        remaining = len(failed_symbols) - min(len(failed_symbols), MAX_FAILED_SYMBOLS_IN_LOG)
+        suffix = "" if remaining <= 0 else f" ... +{remaining}"
+        print(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] "
+            f"Gate history 存在 {len(failed_symbols)} 个失败交易对，将以非零状态退出触发调度重试："
+            f"{preview}{suffix}"
+        )
+        raise SystemExit(1)
 
     collector_log_end("Gate", "history")
 

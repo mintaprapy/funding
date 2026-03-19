@@ -39,6 +39,7 @@ BASEINFO_FRAGILE_EXCHANGES = frozenset({"grvt", "standx"})
 HISTORY_FRAGILE_EXCHANGES = frozenset({"grvt", "edgex"})
 HISTORY_DEDICATED_LANES = {"binance": "binance"}
 APP_META_TABLE = "app_meta"
+BASEINFO_BATCH_COMPLETED_AT_KEY = "baseinfo_batch_completed_at"
 
 @dataclass
 class Job:
@@ -304,6 +305,7 @@ def run_batch(
     running: list[RunningTask] = []
     stop_logged = False
     max_attempts = max(1, max_attempts)
+    stop_requested = False
 
     while pending or running:
         stop_requested = should_stop is not None and should_stop()
@@ -416,6 +418,11 @@ def run_batch(
 
     cost = time.monotonic() - started
     log(f"[{now_str()}] ===== {name} batch end: {ok}/{len(scripts)} success, {cost:.1f}s =====")
+    if db_path is not None and name.startswith("baseinfo") and not stop_requested:
+        try:
+            record_baseinfo_batch_completed_at(db_path, int(time.time() * 1000))
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{now_str()}] [warn] failed to record baseinfo batch completion: {exc}")
 
 
 def stop_dashboard(proc: subprocess.Popen[str] | None) -> None:
@@ -479,11 +486,10 @@ def _ensure_app_meta_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def record_exchange_baseinfo_completed_at(db_path: Path, exchange_key: str, completed_at_ms: int) -> None:
+def record_app_meta_value(db_path: Path, key: str, value: str, updated_at_ms: int) -> None:
     with sqlite3.connect(db_path) as conn:
         tune_sqlite_connection(conn)
         _ensure_app_meta_table(conn)
-        key = f"exchange_baseinfo_completed_at:{exchange_key}"
         conn.execute(
             f"""
             INSERT INTO {APP_META_TABLE} (key, value, updated_at)
@@ -492,9 +498,23 @@ def record_exchange_baseinfo_completed_at(db_path: Path, exchange_key: str, comp
                 value=excluded.value,
                 updated_at=excluded.updated_at
             """,
-            (key, str(completed_at_ms), completed_at_ms),
+            (key, value, updated_at_ms),
         )
         conn.commit()
+
+
+def record_exchange_baseinfo_completed_at(db_path: Path, exchange_key: str, completed_at_ms: int) -> None:
+    key = f"exchange_baseinfo_completed_at:{exchange_key}"
+    record_app_meta_value(db_path, key, str(completed_at_ms), completed_at_ms)
+
+
+def record_baseinfo_batch_completed_at(db_path: Path, completed_at_ms: int) -> None:
+    record_app_meta_value(
+        db_path,
+        BASEINFO_BATCH_COMPLETED_AT_KEY,
+        str(completed_at_ms),
+        completed_at_ms,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -667,6 +687,7 @@ def main() -> None:
                 "baseinfo(startup)",
                 args.python,
                 baseinfo_scripts,
+                db_path=db_path,
                 should_stop=lambda: stop_requested,
                 max_attempts=args.script_max_attempts,
                 retry_wait_s=args.script_retry_wait,
@@ -683,6 +704,7 @@ def main() -> None:
                 "history(startup)",
                 args.python,
                 history_scripts,
+                db_path=db_path,
                 should_stop=lambda: stop_requested,
                 max_attempts=args.script_max_attempts,
                 retry_wait_s=args.script_retry_wait,
@@ -700,6 +722,7 @@ def main() -> None:
                     "alerts(startup)",
                     args.python,
                     [alert_script],
+                    db_path=db_path,
                     should_stop=lambda: stop_requested,
                     max_attempts=1,
                     retry_wait_s=args.script_retry_wait,
@@ -741,6 +764,7 @@ def main() -> None:
                         job.name,
                         args.python,
                         job.scripts,
+                        db_path=db_path,
                         should_stop=lambda: stop_requested,
                         max_attempts=args.script_max_attempts,
                         retry_wait_s=args.script_retry_wait,

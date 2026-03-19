@@ -36,6 +36,16 @@ DEFAULT_OUTPUT_ROOT = ROOT / "exports"
 DEFAULT_API_URL = "http://127.0.0.1:5000/api/data"
 DEFAULT_DB_PATH = ROOT / "funding.db"
 WINDOW_KEYS = ("h24", "d3", "d7", "d15", "d30")
+ERROR_LIKE_PATTERNS = (
+    re.compile(r"\[error\]", re.IGNORECASE),
+    re.compile(r"traceback", re.IGNORECASE),
+    re.compile(r"exception occurred during processing of request", re.IGNORECASE),
+    re.compile(r"\b(?:brokenpipeerror|connectionreseterror|connectionabortederror)\b", re.IGNORECASE),
+    re.compile(r"\b(?:timed out|timeout|refused|failed)\b", re.IGNORECASE),
+    re.compile(r"\b(?:client error|server error)\b", re.IGNORECASE),
+    re.compile(r"\berr=(?:403|429)\b", re.IGNORECASE),
+    re.compile(r"\bhttp (?:403|429|5\d{2})\b", re.IGNORECASE),
+)
 
 
 @dataclass
@@ -124,9 +134,11 @@ def summarize_journal(journal_path: Path, output_dir: Path) -> dict[str, Any]:
         return summary
 
     lines = journal_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    lower_markers = ("error", "traceback", "exception", "failed", "timeout", "timed out", "403", "429", "refused")
     relevant_lines: list[str] = []
     warn_counter: Counter[str] = Counter()
+
+    def is_error_like_line(line: str) -> bool:
+        return any(pattern.search(line) for pattern in ERROR_LIKE_PATTERNS)
 
     def normalize(line: str) -> str:
         line = re.sub(r"^.*?(python\[\d+\]:|systemd\[\d+\]:)\s*", "", line)
@@ -134,8 +146,7 @@ def summarize_journal(journal_path: Path, output_dir: Path) -> dict[str, Any]:
         return line.strip()
 
     for line in lines:
-        lower = line.lower()
-        if "[warn]" in line or any(marker in lower for marker in lower_markers):
+        if "[warn]" in line or is_error_like_line(line):
             relevant_lines.append(line)
         if "[warn]" in line:
             warn_counter[normalize(line)] += 1
@@ -144,7 +155,7 @@ def summarize_journal(journal_path: Path, output_dir: Path) -> dict[str, Any]:
         "exists": True,
         "line_count": len(lines),
         "warn_count": sum(1 for line in lines if "[warn]" in line),
-        "error_like_count": sum(1 for line in lines if any(marker in line.lower() for marker in lower_markers)),
+        "error_like_count": sum(1 for line in lines if is_error_like_line(line)),
         "service_start_count": sum("Started funding-stack.service" in line for line in lines),
         "service_stop_count": sum("Stopping funding-stack.service" in line for line in lines),
         "service_main_exit_count": sum("Main process exited" in line for line in lines),
