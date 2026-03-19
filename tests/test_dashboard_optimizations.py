@@ -255,9 +255,9 @@ class DashboardOptimizationTests(unittest.TestCase):
 
     def test_render_html_contains_virtualized_table_markers(self) -> None:
         html = dashboard.render_html()
-        self.assertIn("VIRTUALIZE_MIN_ROWS", html)
-        self.assertIn("renderVirtualRows", html)
-        self.assertIn("choice-state", html)
+        self.assertIn("pollMetaAndRefresh", html)
+        self.assertIn("appendRowsInChunks", html)
+        self.assertNotIn("choice-state", html)
 
     def test_alerts_h4_threshold_reads_payload_sums(self) -> None:
         payload = {

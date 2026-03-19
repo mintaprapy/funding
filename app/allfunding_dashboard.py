@@ -1613,38 +1613,6 @@ def _render_html(*, static_payload_json: str) -> str:
       color: var(--muted);
       font-size: 11px;
       line-height: 1.2;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      flex-wrap: wrap;
-    }}
-    .choice-state {{
-      display: inline-flex;
-      align-items: center;
-      padding: 2px 6px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      font-size: 10px;
-      line-height: 1;
-    }}
-    .choice-state.state-fresh {{
-      color: var(--success);
-      border-color: rgba(16, 185, 129, 0.35);
-      background: rgba(16, 185, 129, 0.08);
-    }}
-    .choice-state.state-lagging {{
-      color: #f59e0b;
-      border-color: rgba(245, 158, 11, 0.35);
-      background: rgba(245, 158, 11, 0.08);
-    }}
-    .choice-state.state-stale,
-    .choice-state.state-missing {{
-      color: var(--danger);
-      border-color: rgba(239, 68, 68, 0.35);
-      background: rgba(239, 68, 68, 0.08);
-    }}
-    .choice-state.state-unknown {{
-      color: var(--muted);
     }}
     .badge {{
       display: inline-flex;
@@ -1713,8 +1681,7 @@ def _render_html(*, static_payload_json: str) -> str:
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 16px;
-      overflow: auto;
-      max-height: min(74vh, 1100px);
+      overflow: visible;
       box-shadow: 0 20px 50px rgba(0,0,0,0.28);
     }}
     table {{
@@ -1744,14 +1711,6 @@ def _render_html(*, static_payload_json: str) -> str:
     }}
     tbody tr:hover {{
       background: var(--card-strong);
-    }}
-    tbody tr.virtual-spacer:hover {{
-      background: transparent;
-    }}
-    tbody tr.virtual-spacer td {{
-      padding: 0;
-      border-bottom: none;
-      height: 0;
     }}
     .num {{
       font-family: 'Menlo', 'SFMono-Regular', Consolas, monospace;
@@ -1858,16 +1817,6 @@ def _render_html(*, static_payload_json: str) -> str:
     const WINDOW_DAYS_BY_KEY = Object.fromEntries(WINDOWS_META.map(w => [w.key, w.spanMs / 86400000]));
     const STR_COLLATOR = new Intl.Collator(undefined, {{ numeric: true, sensitivity: 'base' }});
     const RENDER_CHUNK_SIZE = 180;
-    const VIRTUALIZE_MIN_ROWS = 160;
-    const VIRTUAL_ROW_HEIGHT = 48;
-    const VIRTUAL_OVERSCAN = 16;
-    const EXCHANGE_STATUS_LABELS = {{
-      fresh: '正常',
-      lagging: '滞后',
-      stale: '过期',
-      missing: '缺失',
-      unknown: '未知',
-    }};
     const toPct = (v) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(4) + '%';
     const toPctFixed = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(digits) + '%';
     const toNum = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : Number(v).toLocaleString(undefined, {{ maximumFractionDigits: digits }});
@@ -1892,19 +1841,14 @@ def _render_html(*, static_payload_json: str) -> str:
     let selectedExchanges = new Set(EXCHANGES_META.map(x => x.key));
     let exchangeCounts = {{}};
     let exchangeUpdatedAt = {{}};
-    let exchangeFreshness = {{}};
     let fixedColumnsApplied = false;
     let renderVersion = 0;
     let scheduledRender = null;
     let pendingRenderPreferFullReplace = false;
-    let pendingRenderResetScroll = false;
     let baseinfoBatchCompletedAt = null;
     let dataLoadInFlight = false;
     let metaPollInFlight = false;
     let autoRefreshHandle = null;
-    let renderedRows = [];
-    let virtualRowHeight = VIRTUAL_ROW_HEIGHT;
-    let virtualRenderHandle = null;
 
     function exchangeLabel(key) {{
       const hit = EXCHANGES_META.find(x => x.key === key);
@@ -1966,19 +1910,6 @@ def _render_html(*, static_payload_json: str) -> str:
       return Number.isFinite(num) && num > 0 ? num : null;
     }}
 
-    function exchangeFreshnessEntry(key) {{
-      return exchangeFreshness[key] || {{ status: 'unknown', lagMs: null, ageMs: null }};
-    }}
-
-    function summarizeExchangeFreshness() {{
-      const counts = {{ fresh: 0, lagging: 0, stale: 0, missing: 0, unknown: 0 }};
-      EXCHANGES_META.forEach(item => {{
-        const status = exchangeFreshnessEntry(item.key).status || 'unknown';
-        counts[status] = (counts[status] || 0) + 1;
-      }});
-      return counts;
-    }}
-
     function renderExchangeChoices() {{
       const group = document.getElementById('exchangeChoices');
       if (!group) return;
@@ -1990,8 +1921,7 @@ def _render_html(*, static_payload_json: str) -> str:
           label: x.label,
           count: exchangeCounts[x.key] || 0,
           checked: selectedExchanges.has(x.key),
-          updatedLabel: formatExchangeUpdatedAt(exchangeUpdatedAt[x.key]),
-          freshness: exchangeFreshnessEntry(x.key),
+          meta: formatExchangeUpdatedAt(exchangeUpdatedAt[x.key]),
         }})),
       ];
       group.innerHTML = items.map(item => `
@@ -2003,7 +1933,7 @@ def _render_html(*, static_payload_json: str) -> str:
                 <span class="choice-text">${'{'}item.label{'}'}</span>
                 <span class="choice-count">${'{'}item.count{'}'}</span>
               </span>
-              ${'{'}item.key === 'all' ? '' : `<span class="choice-meta"><span>${'{'}item.updatedLabel || '—'{'}'}</span><span class="choice-state state-${'{'}item.freshness.status || 'unknown'{'}'}">${'{'}EXCHANGE_STATUS_LABELS[item.freshness.status] || EXCHANGE_STATUS_LABELS.unknown{'}'}</span></span>`{'}'}
+              ${'{'}item.meta ? `<span class="choice-meta">${'{'}item.meta{'}'}</span>` : ''{'}'}
             </span>
           </label>
         </div>
@@ -2029,7 +1959,7 @@ def _render_html(*, static_payload_json: str) -> str:
         }}
       }}
       renderExchangeChoices();
-      render({{ resetScroll: true }});
+      render();
     }}
 
     function applyFixedColumnWidths() {{
@@ -2106,9 +2036,7 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
       exchangeCounts = counts;
       exchangeUpdatedAt = updatedMap;
-      exchangeFreshness = payload.exchangeFreshness || {{}};
-      const freshnessCounts = summarizeExchangeFreshness();
-      footer.textContent = `历史数据 1 小时更新一次，其他数据 10 分钟更新一次 · 交易所状态：正常 ${'{'}freshnessCounts.fresh || 0{'}'} / 滞后 ${'{'}freshnessCounts.lagging || 0{'}'} / 过期 ${'{'}freshnessCounts.stale || 0{'}'} / 缺失 ${'{'}freshnessCounts.missing || 0{'}'}`;
+      footer.textContent = '历史数据 1 小时更新一次，其他数据 10 分钟更新一次';
       renderExchangeChoices();
     }}
 
@@ -2169,69 +2097,26 @@ def _render_html(*, static_payload_json: str) -> str:
       `;
     }}
 
-    function renderVirtualRows(body, rows, {{ resetScroll = false }} = {{}}) {{
-      const viewport = document.querySelector('.table-wrap');
-      if (!viewport) {{
-        body.innerHTML = rows.map(renderRow).join('');
+    function appendRowsInChunks(body, rows, version, offset = 0) {{
+      if (version !== renderVersion) return;
+      const chunk = rows.slice(offset, offset + RENDER_CHUNK_SIZE);
+      if (!chunk.length) {{
         if (!fixedColumnsApplied) applyFixedColumnWidths();
         return;
       }}
-      if (resetScroll) viewport.scrollTop = 0;
-      const totalRows = rows.length;
-      const viewportHeight = Math.max(240, viewport.clientHeight || 0);
-      const visibleCount = Math.max(1, Math.ceil(viewportHeight / virtualRowHeight));
-      const start = Math.max(0, Math.floor(viewport.scrollTop / virtualRowHeight) - VIRTUAL_OVERSCAN);
-      const end = Math.min(totalRows, start + visibleCount + VIRTUAL_OVERSCAN * 2);
-      const topHeight = start * virtualRowHeight;
-      const bottomHeight = Math.max(0, (totalRows - end) * virtualRowHeight);
-      let html = '';
-      if (topHeight > 0) {{
-        html += `<tr class="virtual-spacer" aria-hidden="true"><td colspan="99" style="height:${'{'}topHeight{'}'}px"></td></tr>`;
+      body.insertAdjacentHTML('beforeend', chunk.map(renderRow).join(''));
+      const nextOffset = offset + chunk.length;
+      if (nextOffset >= rows.length) {{
+        if (!fixedColumnsApplied) applyFixedColumnWidths();
+        return;
       }}
-      html += rows.slice(start, end).map(renderRow).join('');
-      if (bottomHeight > 0) {{
-        html += `<tr class="virtual-spacer" aria-hidden="true"><td colspan="99" style="height:${'{'}bottomHeight{'}'}px"></td></tr>`;
-      }}
-      body.innerHTML = html;
-      const sampleRow = body.querySelector('tr:not(.virtual-spacer)');
-      if (sampleRow) {{
-        const measured = Math.round(sampleRow.getBoundingClientRect().height);
-        if (measured > 16 && Math.abs(measured - virtualRowHeight) >= 2) {{
-          virtualRowHeight = measured;
-          requestAnimationFrame(() => renderVirtualRows(body, rows));
-          return;
-        }}
-      }}
-      if (!fixedColumnsApplied) applyFixedColumnWidths();
+      requestAnimationFrame(() => appendRowsInChunks(body, rows, version, nextOffset));
     }}
 
-    function scheduleVirtualRows() {{
-      if (virtualRenderHandle) cancelAnimationFrame(virtualRenderHandle);
-      virtualRenderHandle = requestAnimationFrame(() => {{
-        virtualRenderHandle = null;
-        const body = document.getElementById('table-body');
-        if (!body || renderedRows.length <= VIRTUALIZE_MIN_ROWS) return;
-        renderVirtualRows(body, renderedRows);
-      }});
-    }}
-
-    function bindTableViewport() {{
-      const viewport = document.querySelector('.table-wrap');
-      if (!viewport || viewport.dataset.virtualBound === '1') return;
-      viewport.dataset.virtualBound = '1';
-      viewport.addEventListener('scroll', () => {{
-        if (renderedRows.length <= VIRTUALIZE_MIN_ROWS) return;
-        scheduleVirtualRows();
-      }});
-      window.addEventListener('resize', () => {{
-        fixedColumnsApplied = false;
-        render();
-      }});
-    }}
-
-    function renderNow({{ preferFullReplace = false, resetScroll = false }} = {{}}) {{
+    function renderNow({{ preferFullReplace = false }} = {{}}) {{
       const body = document.getElementById('table-body');
       renderVersion += 1;
+      const version = renderVersion;
       const rawQuery = document.getElementById('searchBox').value.trim().toUpperCase();
       const exactSearch = rawQuery.endsWith('/');
       const q = exactSearch ? rawQuery.slice(0, -1).trim() : rawQuery;
@@ -2278,34 +2163,30 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
 
       if (!sorted.length) {{
-        renderedRows = [];
         body.innerHTML = '<tr><td colspan="99" class="dim">暂无数据：请先运行采集脚本写入 funding.db</td></tr>';
         updateSortIndicators();
         return;
       }}
 
       updateSortIndicators();
-      renderedRows = sorted;
-      fixedColumnsApplied = false;
-      if (sorted.length <= VIRTUALIZE_MIN_ROWS) {{
+      if (preferFullReplace) {{
+        fixedColumnsApplied = false;
         body.innerHTML = sorted.map(renderRow).join('');
         applyFixedColumnWidths();
         return;
       }}
-      renderVirtualRows(body, sorted, {{ resetScroll }});
+      body.innerHTML = '';
+      appendRowsInChunks(body, sorted, version);
     }}
 
-    function render({{ preferFullReplace = false, resetScroll = false }} = {{}}) {{
+    function render({{ preferFullReplace = false }} = {{}}) {{
       pendingRenderPreferFullReplace = pendingRenderPreferFullReplace || preferFullReplace;
-      pendingRenderResetScroll = pendingRenderResetScroll || resetScroll;
       if (scheduledRender) cancelAnimationFrame(scheduledRender);
       scheduledRender = requestAnimationFrame(() => {{
         const useFullReplace = pendingRenderPreferFullReplace;
-        const useResetScroll = pendingRenderResetScroll;
         pendingRenderPreferFullReplace = false;
-        pendingRenderResetScroll = false;
         scheduledRender = null;
-        renderNow({{ preferFullReplace: useFullReplace, resetScroll: useResetScroll }});
+        renderNow({{ preferFullReplace: useFullReplace }});
       }});
     }}
 
@@ -2341,7 +2222,7 @@ def _render_html(*, static_payload_json: str) -> str:
     let searchDebounce = null;
     document.getElementById('searchBox').addEventListener('input', () => {{
       if (searchDebounce) clearTimeout(searchDebounce);
-      searchDebounce = setTimeout(() => render({{ resetScroll: true }}), 80);
+      searchDebounce = setTimeout(render, 80);
     }});
 
     const oiFilter = document.getElementById('oiFilter');
@@ -2353,7 +2234,7 @@ def _render_html(*, static_payload_json: str) -> str:
     oiFilter.addEventListener('input', (e) => {{
       oiThresholdIdx = Number(e.target.value) || 0;
       updateOiLabel();
-      render({{ resetScroll: true }});
+      render();
     }});
     updateOiLabel();
 
@@ -2367,12 +2248,11 @@ def _render_html(*, static_payload_json: str) -> str:
           sortKey = key;
           sortDir = (key === 'symbol' || key === 'exchange') ? 'asc' : 'desc';
         }}
-        render({{ resetScroll: true }});
+        render();
       }});
     }});
     updateSortIndicators();
 
-    bindTableViewport();
     startAutoRefresh();
     load().catch(err => {{
       document.getElementById('table-body').innerHTML = `<tr><td colspan="99" class="dim">加载失败：${'{'}err.message{'}'}</td></tr>`;
