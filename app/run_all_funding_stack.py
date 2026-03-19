@@ -595,7 +595,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--alert-minutes",
         default="0,5,10,15,20,25,30,35,40,45,50,55",
-        help="Comma-separated minute list for alert checks",
+        help="Deprecated and ignored; alerts now run after each baseinfo batch completes",
     )
     parser.add_argument("--disable-alerts", action="store_true", help="Do not run alert checks")
     return parser.parse_args()
@@ -605,7 +605,6 @@ def main() -> None:
     args = parse_args()
     baseinfo_minutes = parse_minutes(args.baseinfo_minutes)
     history_minutes = parse_minutes(args.history_minutes)
-    alert_minutes = parse_minutes(args.alert_minutes)
     exchange_config_path = Path(args.exchange_config).expanduser().resolve()
     alert_config_path = Path(args.alert_config).expanduser().resolve()
     try:
@@ -647,8 +646,6 @@ def main() -> None:
         Job(name="baseinfo", minutes=baseinfo_minutes, scripts=baseinfo_scripts),
         Job(name="history", minutes=history_minutes, scripts=history_scripts),
     ]
-    if not args.disable_alerts:
-        jobs.append(Job(name="alerts", minutes=alert_minutes, scripts=[alert_script]))
 
     try:
         try:
@@ -669,7 +666,25 @@ def main() -> None:
         log(f"[{now_str()}] exchange config: {exchange_config_path}")
         if not args.disable_alerts:
             log(f"[{now_str()}] alert config: {alert_config_path}")
+            log(f"[{now_str()}] alert trigger: after each baseinfo batch completion")
         prepare_sqlite_runtime(db_path)
+
+        def run_alert_batch(batch_name: str) -> None:
+            run_batch(
+                batch_name,
+                args.python,
+                [alert_script],
+                db_path=db_path,
+                should_stop=lambda: stop_requested,
+                max_attempts=1,
+                retry_wait_s=args.script_retry_wait,
+                script_timeout_s=30.0,
+                script_exchange_keys=script_exchange_keys,
+                script_exchange_labels=script_exchange_labels,
+                baseinfo_general_workers=args.baseinfo_general_workers,
+                history_general_workers=args.history_general_workers,
+                fragile_workers=args.fragile_workers,
+            )
 
         if not args.skip_dashboard:
             dashboard_proc, dashboard_port = start_dashboard(args.python, args.host, args.port)
@@ -700,6 +715,10 @@ def main() -> None:
             )
             if stop_requested:
                 return
+            if not args.disable_alerts:
+                run_alert_batch("alerts(startup-after-baseinfo)")
+                if stop_requested:
+                    return
             run_batch(
                 "history(startup)",
                 args.python,
@@ -717,24 +736,6 @@ def main() -> None:
             )
             if stop_requested:
                 return
-            if not args.disable_alerts:
-                run_batch(
-                    "alerts(startup)",
-                    args.python,
-                    [alert_script],
-                    db_path=db_path,
-                    should_stop=lambda: stop_requested,
-                    max_attempts=1,
-                    retry_wait_s=args.script_retry_wait,
-                    script_timeout_s=30.0,
-                    script_exchange_keys=script_exchange_keys,
-                    script_exchange_labels=script_exchange_labels,
-                    baseinfo_general_workers=args.baseinfo_general_workers,
-                    history_general_workers=args.history_general_workers,
-                    fragile_workers=args.fragile_workers,
-                )
-                if stop_requested:
-                    return
 
         if args.once:
             return
@@ -777,6 +778,10 @@ def main() -> None:
                     )
                     if stop_requested:
                         break
+                    if job.name == "baseinfo" and not args.disable_alerts:
+                        run_alert_batch("alerts(after-baseinfo)")
+                        if stop_requested:
+                            break
                     job.next_run = compute_next_run(datetime.now(), job.minutes)
                     log(f"[{now_str()}] next {job.name} run at {job.next_run.strftime('%Y-%m-%d %H:%M:%S')}")
                 if stop_requested:

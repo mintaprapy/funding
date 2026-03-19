@@ -275,7 +275,7 @@ python3 -m app.run_all_funding_stack --help
 - `--lock-file .run_all_funding_stack.lock`（单实例锁文件）
 - `--exchange-config config/exchanges.json`（控制启用哪些交易所）
 - `--alert-config config/alerts.json`（控制阈值告警和通知渠道；也可用 `FUNDING_ALERT_CONFIG` 指定）
-- `--alert-minutes "0,5,10,15,20,25,30,35,40,45,50,55"`（告警检查分钟）
+- `--alert-minutes "0,5,10,15,20,25,30,35,40,45,50,55"`（已废弃，保留兼容；告警现在会在每轮 `baseinfo` 全部完成后自动触发）
 - `--disable-alerts`（禁用告警任务）
 
 常见调试命令：
@@ -365,6 +365,10 @@ python3 app/funding_alerts.py --config /abs/path/to/alerts.json --dry-run --forc
 ```bash
 python3 -m app.run_all_funding_stack --disable-alerts
 ```
+
+当前调度逻辑：
+- 阈值告警不再按固定分钟轮询
+- 每次一整轮 `baseinfo` 全部结束后，调度器会立刻执行一次告警检查
 
 ## 7. 停止服务
 停止主调度/面板：
