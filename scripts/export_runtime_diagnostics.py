@@ -31,6 +31,7 @@ from core.funding_exchanges import ExchangeDef, enabled_exchanges
 
 
 DEFAULT_SERVICE = "funding-stack"
+DEFAULT_EXTRA_SERVICES = ("nginx", "systemd-resolved")
 DEFAULT_HOURS = 12
 DEFAULT_OUTPUT_ROOT = ROOT / "exports"
 DEFAULT_API_URL = "http://127.0.0.1:5000/api/data"
@@ -113,24 +114,25 @@ def collect_system_info(output_dir: Path) -> None:
 
 
 def collect_service_artifacts(service: str, hours: int, output_dir: Path) -> dict[str, Any]:
+    stem_prefix = sanitize_name(service)
     results = {
-        "status": run_command(["systemctl", "status", service, "--no-pager"], output_dir, "systemctl_status"),
-        "is_active": run_command(["systemctl", "is-active", service], output_dir, "systemctl_is_active"),
-        "show": run_command(["systemctl", "show", service], output_dir, "systemctl_show"),
-        "cat": run_command(["systemctl", "cat", service], output_dir, "systemctl_cat"),
+        "status": run_command(["systemctl", "status", service, "--no-pager"], output_dir, f"{stem_prefix}.systemctl_status"),
+        "is_active": run_command(["systemctl", "is-active", service], output_dir, f"{stem_prefix}.systemctl_is_active"),
+        "show": run_command(["systemctl", "show", service], output_dir, f"{stem_prefix}.systemctl_show"),
+        "cat": run_command(["systemctl", "cat", service], output_dir, f"{stem_prefix}.systemctl_cat"),
         "journal": run_command(
             ["journalctl", "-u", service, "--since", f"{hours} hours ago", "--no-pager"],
             output_dir,
-            f"journal_last_{hours}h",
+            f"{stem_prefix}.journal_last_{hours}h",
         ),
     }
     return {key: asdict(value) for key, value in results.items()}
 
 
-def summarize_journal(journal_path: Path, output_dir: Path) -> dict[str, Any]:
+def summarize_journal(journal_path: Path, output_dir: Path, stem: str = "journal") -> dict[str, Any]:
     if not journal_path.exists():
         summary = {"exists": False}
-        write_text(output_dir / "journal_summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
+        write_text(output_dir / f"{stem}_summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
         return summary
 
     lines = journal_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -161,8 +163,8 @@ def summarize_journal(journal_path: Path, output_dir: Path) -> dict[str, Any]:
         "service_main_exit_count": sum("Main process exited" in line for line in lines),
         "top_warn_messages": warn_counter.most_common(30),
     }
-    write_text(output_dir / "journal_summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
-    write_text(output_dir / "journal_relevant.txt", "\n".join(relevant_lines) + ("\n" if relevant_lines else ""))
+    write_text(output_dir / f"{stem}_summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
+    write_text(output_dir / f"{stem}_relevant.txt", "\n".join(relevant_lines) + ("\n" if relevant_lines else ""))
     return summary
 
 
@@ -194,6 +196,45 @@ def collect_repo_artifacts(output_dir: Path) -> None:
         if path.is_file():
             shutil.copy2(path, output_dir / f"logs.{path.name}")
     write_text(output_dir / "logs_listing.json", json.dumps(listing, ensure_ascii=False, indent=2))
+
+
+def collect_dns_artifacts(hours: int, output_dir: Path) -> dict[str, Any]:
+    results = {
+        "resolvectl_status": run_command(["resolvectl", "status"], output_dir, "dns.resolvectl_status"),
+        "resolvectl_statistics": run_command(["resolvectl", "statistics"], output_dir, "dns.resolvectl_statistics"),
+        "resolved_journal": run_command(
+            ["journalctl", "-u", "systemd-resolved", "--since", f"{hours} hours ago", "--no-pager"],
+            output_dir,
+            f"dns.systemd_resolved_last_{hours}h",
+        ),
+    }
+    copy_optional_file(Path("/etc/resolv.conf"), output_dir / "dns.etc_resolv.conf")
+    copy_optional_file(Path("/run/systemd/resolve/stub-resolv.conf"), output_dir / "dns.stub_resolv.conf")
+    copy_optional_file(Path("/run/systemd/resolve/resolv.conf"), output_dir / "dns.systemd_resolv.conf")
+    return {key: asdict(value) for key, value in results.items()}
+
+
+def collect_nginx_log_artifacts(output_dir: Path, tail_lines: int = 4000) -> dict[str, Any]:
+    candidates = {
+        "nginx.error_log": Path("/var/log/nginx/error.log"),
+        "nginx.access_log": Path("/var/log/nginx/access.log"),
+    }
+    summary: dict[str, Any] = {}
+    for label, src in candidates.items():
+        dst = output_dir / f"{label}.tail.txt"
+        if src.exists():
+            result = run_command(["tail", "-n", str(tail_lines), str(src)], output_dir, label)
+            summary[label] = asdict(result)
+        else:
+            write_text(dst, "")
+            summary[label] = {
+                "cmd": ["tail", "-n", str(tail_lines), str(src)],
+                "returncode": 1,
+                "stdout_path": str(dst.name),
+                "stderr_path": "",
+                "missing": True,
+            }
+    return summary
 
 
 def backup_database(db_path: Path, output_dir: Path) -> Path | None:
@@ -410,15 +451,26 @@ def fetch_api_payload(api_url: str, output_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def parse_services(primary: str, extra: str) -> list[str]:
+    items: list[str] = []
+    for raw in [primary, *extra.split(",")]:
+        value = raw.strip()
+        if value and value not in items:
+            items.append(value)
+    return items
+
+
 def build_report(
     output_dir: Path,
     *,
-    service: str,
+    services: list[str],
     hours: int,
     db_path: Path,
     tar_name: str,
-    service_summary: dict[str, Any],
-    journal_summary: dict[str, Any],
+    service_summaries: dict[str, dict[str, Any]],
+    journal_summaries: dict[str, dict[str, Any]],
+    dns_summary: dict[str, Any],
+    nginx_log_summary: dict[str, Any],
     db_summary: dict[str, Any],
     api_summary: dict[str, Any],
 ) -> None:
@@ -426,38 +478,47 @@ def build_report(
         "# Funding Runtime Diagnostic Report",
         "",
         f"- generated_at: {now_local().isoformat()}",
-        f"- service: `{service}`",
+        f"- services: `{', '.join(services)}`",
         f"- window_hours: `{hours}`",
         f"- db_path: `{db_path}`",
         f"- archive: `{tar_name}`",
         "",
         "## Service",
         "",
-        f"- status_returncode: `{service_summary['status']['returncode']}`",
-        f"- is_active_returncode: `{service_summary['is_active']['returncode']}`",
-        f"- journal_returncode: `{service_summary['journal']['returncode']}`",
-        "",
-        "## Journal Summary",
-        "",
     ]
-    if journal_summary.get("exists"):
+    for service in services:
+        service_summary = service_summaries[service]
+        journal_summary = journal_summaries[service]
         lines.extend(
             [
-                f"- line_count: `{journal_summary['line_count']}`",
-                f"- warn_count: `{journal_summary['warn_count']}`",
-                f"- error_like_count: `{journal_summary['error_like_count']}`",
-                f"- service_start_count: `{journal_summary['service_start_count']}`",
-                f"- service_stop_count: `{journal_summary['service_stop_count']}`",
-                f"- service_main_exit_count: `{journal_summary['service_main_exit_count']}`",
+                f"- {service}: status_rc=`{service_summary['status']['returncode']}`, is_active_rc=`{service_summary['is_active']['returncode']}`, journal_rc=`{service_summary['journal']['returncode']}`",
             ]
         )
-        top_warn = journal_summary.get("top_warn_messages") or []
-        if top_warn:
-            lines.extend(["", "### Top Warnings", ""])
-            for message, count in top_warn[:15]:
-                lines.append(f"- `{count}` x {message}")
-    else:
-        lines.append("- journal missing")
+        if journal_summary.get("exists"):
+            lines.extend(
+                [
+                    f"  journal: line_count=`{journal_summary['line_count']}`, warn_count=`{journal_summary['warn_count']}`, error_like_count=`{journal_summary['error_like_count']}`, start_count=`{journal_summary['service_start_count']}`, stop_count=`{journal_summary['service_stop_count']}`, main_exit_count=`{journal_summary['service_main_exit_count']}`",
+                ]
+            )
+            top_warn = journal_summary.get("top_warn_messages") or []
+            for message, count in top_warn[:5]:
+                lines.append(f"  top_warn: `{count}` x {message}")
+        else:
+            lines.append("  journal: missing")
+
+    lines.extend(
+        [
+            "",
+            "## Nginx And DNS",
+            "",
+            f"- nginx access tail rc: `{nginx_log_summary['nginx.access_log']['returncode']}`",
+            f"- nginx error tail rc: `{nginx_log_summary['nginx.error_log']['returncode']}`",
+            f"- resolvectl status rc: `{dns_summary['resolvectl_status']['returncode']}`",
+            f"- resolvectl statistics rc: `{dns_summary['resolvectl_statistics']['returncode']}`",
+            f"- systemd-resolved journal rc: `{dns_summary['resolved_journal']['returncode']}`",
+            "",
+        ]
+    )
 
     lines.extend(["", "## Database Summary", ""])
     if db_summary.get("exists"):
@@ -498,6 +559,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export a funding runtime diagnostic bundle.")
     parser.add_argument("--hours", type=int, default=DEFAULT_HOURS, help="Journal lookback window in hours.")
     parser.add_argument("--service", default=DEFAULT_SERVICE, help="systemd service name.")
+    parser.add_argument(
+        "--extra-services",
+        default=",".join(DEFAULT_EXTRA_SERVICES),
+        help="Additional systemd service names, comma-separated.",
+    )
     parser.add_argument("--db-path", default=os.getenv("FUNDING_DB_PATH") or str(DEFAULT_DB_PATH), help="SQLite DB path.")
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="API endpoint for dashboard payload snapshot.")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Directory to place output bundle and tarball.")
@@ -513,11 +579,22 @@ def main() -> None:
     bundle_dir.mkdir(parents=True, exist_ok=False)
 
     db_path = Path(args.db_path).expanduser().resolve()
+    services = parse_services(args.service, args.extra_services)
 
     collect_system_info(bundle_dir)
-    service_summary = collect_service_artifacts(args.service, args.hours, bundle_dir)
-    journal_path = bundle_dir / f"journal_last_{args.hours}h.out.txt"
-    journal_summary = summarize_journal(journal_path, bundle_dir)
+    service_summaries: dict[str, dict[str, Any]] = {}
+    journal_summaries: dict[str, dict[str, Any]] = {}
+    for service in services:
+        service_summary = collect_service_artifacts(service, args.hours, bundle_dir)
+        service_summaries[service] = service_summary
+        journal_path = bundle_dir / service_summary["journal"]["stdout_path"]
+        journal_summaries[service] = summarize_journal(
+            journal_path,
+            bundle_dir,
+            stem=f"{sanitize_name(service)}.journal",
+        )
+    dns_summary = collect_dns_artifacts(args.hours, bundle_dir)
+    nginx_log_summary = collect_nginx_log_artifacts(bundle_dir)
     collect_repo_artifacts(bundle_dir)
     snapshot_path = backup_database(db_path, bundle_dir)
     db_summary = analyze_database(snapshot_path or db_path, bundle_dir)
@@ -526,12 +603,14 @@ def main() -> None:
     tar_name = f"{bundle_dir.name}.tar.gz"
     build_report(
         bundle_dir,
-        service=args.service,
+        services=services,
         hours=args.hours,
         db_path=db_path,
         tar_name=tar_name,
-        service_summary=service_summary,
-        journal_summary=journal_summary,
+        service_summaries=service_summaries,
+        journal_summaries=journal_summaries,
+        dns_summary=dns_summary,
+        nginx_log_summary=nginx_log_summary,
         db_summary=db_summary,
         api_summary=api_summary,
     )
