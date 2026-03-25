@@ -316,6 +316,7 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 建议流程：
 - 服务器拉取代码后，复制 `config/alerts.example.json` 为 `config/alerts.json`
 - 在 `config/alerts.json` 中填写真实 webhook / bot token
+- 如果你要从网页把标的同步进“飞书告警黑名单”，再额外填写 `dashboard_admin_token`
 - 不要把真实 `config/alerts.json` 提交到 GitHub
 
 示例：
@@ -351,6 +352,7 @@ python3 -m app.run_all_funding_stack --once --skip-dashboard --no-run-on-start
 - `latest_pct_lte`：最新单次资金费率小于等于这个百分比时告警；留空或 `null` 表示不启用
 - `h4_pct_gte`：过去 4 小时累计资金费率大于等于这个百分比时告警；留空或 `null` 表示不启用
 - `h4_pct_lte`：过去 4 小时累计资金费率小于等于这个百分比时告警；留空或 `null` 表示不启用
+- `dashboard_admin_token`：网页管理口令。配置后，浏览器里拉黑的标的可同步到服务端告警黑名单，这些标的将不会触发飞书/Telegram 告警
 - 兼容旧字段名：`latest_abs_pct_*` / `h4_abs_pct_*` 仍可继续使用，但现在也按带符号阈值判断；例如只想监控负值，请把 `*_lte` 配成负数，如 `-0.1`
 - `max_items_per_run`：单次通知最多展开多少条命中项
 

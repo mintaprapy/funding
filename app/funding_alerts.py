@@ -21,7 +21,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.allfunding_dashboard import build_payload, initialize_dashboard_runtime
+from app.allfunding_dashboard import (
+    alert_row_key_for,
+    build_payload,
+    initialize_dashboard_runtime,
+    load_alert_blacklist_row_keys,
+)
 
 DEFAULT_ALERT_CONFIG = ROOT / "config" / "alerts.json"
 ALERT_CONFIG_ENV = "FUNDING_ALERT_CONFIG"
@@ -65,7 +70,12 @@ def parse_threshold(config: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
-def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertHit]:
+def collect_hits(
+    payload: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    blocked_row_keys: set[str] | None = None,
+) -> list[AlertHit]:
     latest_threshold_gte_pct = parse_threshold(config, "latest_pct_gte", "latest_abs_pct_gte")
     latest_threshold_lte_pct = parse_threshold(config, "latest_pct_lte", "latest_abs_pct_lte")
     h4_threshold_gte_pct = parse_threshold(config, "h4_pct_gte", "h4_abs_pct_gte")
@@ -78,12 +88,16 @@ def collect_hits(payload: dict[str, Any], config: dict[str, Any]) -> list[AlertH
     h4_enabled = h4_threshold_gte_pct is not None or h4_threshold_lte_pct is not None
 
     hits: list[AlertHit] = []
+    blocked = blocked_row_keys or set()
     for item in payload.get("items", []):
         if not isinstance(item, dict):
             continue
         exchange = str(item.get("exchangeLabel") or item.get("exchange") or "")
         exchange_key = str(item.get("exchange") or "")
         symbol = str(item.get("symbol") or "")
+        row_key = alert_row_key_for(exchange_key, symbol)
+        if row_key and row_key in blocked:
+            continue
         interval = item.get("fundingIntervalHours")
         try:
             interval_hours = int(interval) if interval is not None else None
@@ -288,7 +302,8 @@ def main() -> None:
         force_refresh=True,
         extra_windows=H4_ALERT_WINDOW if h4_enabled else None,
     )
-    hits = collect_hits(payload, config)
+    blocked_row_keys = load_alert_blacklist_row_keys()
+    hits = collect_hits(payload, config, blocked_row_keys=blocked_row_keys)
     if not hits:
         return
 

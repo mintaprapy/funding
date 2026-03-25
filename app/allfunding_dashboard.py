@@ -7,6 +7,7 @@ import os
 import argparse
 import gzip
 import hashlib
+import hmac
 import json
 import sqlite3
 import sys
@@ -32,6 +33,10 @@ from core.funding_exchanges import dashboard_exchange_meta
 DB_PATH = Path(os.getenv("FUNDING_DB_PATH") or (ROOT / "funding.db")).expanduser().resolve()
 HOST = "127.0.0.1"
 PORT = 5000
+ALERT_CONFIG_ENV = "FUNDING_ALERT_CONFIG"
+DASHBOARD_ADMIN_TOKEN_ENV = "FUNDING_DASHBOARD_ADMIN_TOKEN"
+DEFAULT_ALERT_CONFIG_PATH = ROOT / "config" / "alerts.json"
+DASHBOARD_ADMIN_TOKEN_CONFIG_KEY = "dashboard_admin_token"
 
 WindowDef = tuple[str, int, str]
 
@@ -93,6 +98,7 @@ HISTORY_BATCH_COMPLETED_AT_KEY = "history_batch_completed_at"
 HISTORY_SUMMARIES_WINDOW_SIG_KEY = "history_summaries_window_sig"
 HISTORY_SUMMARIES_BATCH_COMPLETED_AT_KEY = "history_summaries_batch_completed_at"
 HISTORY_SUMMARIES_ANCHOR_MS_KEY = "history_summaries_anchor_ms"
+ALERT_BLACKLIST_META_KEY = "alert_row_blacklist_v1"
 
 
 def _to_number(val: Any) -> float | None:
@@ -238,6 +244,109 @@ def _upsert_app_meta_value(conn: sqlite3.Connection, key: str, value: str, *, up
         """,
         (key, value, ts),
     )
+
+
+def normalize_alert_row_key(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw or "::" not in raw:
+        return None
+    exchange, symbol = raw.split("::", 1)
+    exchange = exchange.strip().lower()
+    symbol = symbol.strip().upper()
+    if not exchange or not symbol:
+        return None
+    return f"{exchange}::{symbol}"
+
+
+def alert_row_key_for(exchange: Any, symbol: Any) -> str | None:
+    exchange_text = str(exchange or "").strip().lower()
+    symbol_text = str(symbol or "").strip().upper()
+    if not exchange_text or not symbol_text:
+        return None
+    return f"{exchange_text}::{symbol_text}"
+
+
+def _fetch_alert_blacklist_row_keys(conn: sqlite3.Connection) -> set[str]:
+    raw = _fetch_app_meta_value(conn, ALERT_BLACKLIST_META_KEY)
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    out: set[str] = set()
+    for value in parsed:
+        row_key = normalize_alert_row_key(value)
+        if row_key:
+            out.add(row_key)
+    return out
+
+
+def _store_alert_blacklist_row_keys(
+    conn: sqlite3.Connection,
+    row_keys: set[str],
+    *,
+    updated_at_ms: int | None = None,
+) -> set[str]:
+    normalized = sorted({row_key for row_key in (normalize_alert_row_key(value) for value in row_keys) if row_key})
+    _upsert_app_meta_value(
+        conn,
+        ALERT_BLACKLIST_META_KEY,
+        json.dumps(normalized, ensure_ascii=False),
+        updated_at_ms=updated_at_ms,
+    )
+    return set(normalized)
+
+
+def load_alert_blacklist_row_keys() -> set[str]:
+    with connect_db() as conn:
+        return _fetch_alert_blacklist_row_keys(conn)
+
+
+def update_alert_blacklist_row_keys(
+    *,
+    row_key: str | None = None,
+    blocked: bool | None = None,
+    clear_all: bool = False,
+    replace_all_row_keys: set[str] | None = None,
+) -> set[str]:
+    with connect_db() as conn:
+        if replace_all_row_keys is not None:
+            row_keys = set(replace_all_row_keys)
+        else:
+            row_keys = _fetch_alert_blacklist_row_keys(conn)
+        if clear_all:
+            row_keys.clear()
+        elif replace_all_row_keys is None:
+            normalized = normalize_alert_row_key(row_key)
+            if normalized is None or blocked is None:
+                raise ValueError("invalid row key update")
+            if blocked:
+                row_keys.add(normalized)
+            else:
+                row_keys.discard(normalized)
+        stored = _store_alert_blacklist_row_keys(conn, row_keys)
+        conn.commit()
+        return stored
+
+
+def load_dashboard_admin_token() -> str:
+    env_value = str(os.getenv(DASHBOARD_ADMIN_TOKEN_ENV) or "").strip()
+    if env_value:
+        return env_value
+    config_path = Path(os.getenv(ALERT_CONFIG_ENV) or DEFAULT_ALERT_CONFIG_PATH).expanduser().resolve()
+    if not config_path.exists():
+        return ""
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    raw = payload.get(DASHBOARD_ADMIN_TOKEN_CONFIG_KEY)
+    return str(raw).strip() if raw not in (None, "") else ""
 
 
 def fetch_exchange_baseinfo_completed_at(conn: sqlite3.Connection) -> dict[str, int]:
@@ -1630,6 +1739,93 @@ def _render_html(*, static_payload_json: str) -> str:
       gap: 8px;
       min-width: 260px;
     }}
+    .blacklist-pill {{
+      flex-direction: row;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }}
+    .blacklist-title {{
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1;
+      white-space: nowrap;
+    }}
+    .blacklist-title strong {{
+      color: var(--text);
+      font-family: 'Menlo', 'SFMono-Regular', Consolas, monospace;
+      font-size: 14px;
+    }}
+    .blacklist-tools {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .tool-actions {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .blacklist-toggle {{
+      gap: 0;
+      min-height: 28px;
+    }}
+    .toggle-inline {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .toggle-inline input {{
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: var(--accent);
+    }}
+    .sr-only {{
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }}
+    .ghost-btn,
+    .row-toggle-btn {{
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }}
+    .ghost-btn {{
+      padding: 7px 10px;
+    }}
+    .ghost-btn:disabled {{
+      cursor: default;
+      opacity: 0.45;
+    }}
+    .ghost-btn:not(:disabled):hover,
+    .row-toggle-btn:hover {{
+      background: rgba(34,211,238,0.12);
+      border-color: rgba(34,211,238,0.45);
+    }}
     .range-title {{
       display: flex;
       align-items: baseline;
@@ -1733,6 +1929,131 @@ def _render_html(*, static_payload_json: str) -> str:
       align-items: flex-end;
       gap: 2px;
     }}
+    .symbol-cell {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }}
+    .row-toggle-btn {{
+      padding: 5px 8px;
+      flex: none;
+      white-space: nowrap;
+    }}
+    .row-toggle-btn.active {{
+      color: var(--danger);
+      border-color: rgba(239, 68, 68, 0.35);
+      background: rgba(239, 68, 68, 0.08);
+    }}
+    tbody tr.row-blacklisted {{
+      opacity: 0.55;
+    }}
+    .modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      background: rgba(6, 10, 18, 0.72);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      z-index: 30;
+    }}
+    .modal-backdrop.open {{
+      display: flex;
+    }}
+    .modal-panel {{
+      width: min(920px, 100%);
+      max-height: min(82vh, 900px);
+      overflow: auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 30px 80px rgba(0,0,0,0.42);
+      padding: 18px 18px 16px;
+    }}
+    .modal-header {{
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      margin-bottom: 14px;
+      min-height: 40px;
+    }}
+    .modal-title {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      align-items: center;
+      text-align: center;
+    }}
+    .modal-title h2 {{
+      margin: 0;
+      font-size: 18px;
+    }}
+    .modal-title span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .modal-actions {{
+      position: absolute;
+      right: 0;
+      top: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .modal-table {{
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }}
+    .modal-table th,
+    .modal-table td {{
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      vertical-align: middle;
+    }}
+    .modal-table th {{
+      color: var(--muted);
+      text-align: left;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-transform: none;
+      position: static;
+      backdrop-filter: none;
+    }}
+    .note-input {{
+      width: 100%;
+      height: 34px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.03);
+      color: var(--text);
+      padding: 0 10px;
+      font-size: 13px;
+      box-sizing: border-box;
+      outline: none;
+    }}
+    .note-input:focus {{
+      border-color: rgba(34,211,238,0.5);
+      box-shadow: 0 0 0 3px rgba(34,211,238,0.12);
+    }}
+    .empty-blacklist {{
+      padding: 28px 8px 12px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }}
+    .row-actions {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
     .mini {{
       font-size: 11px;
       color: var(--muted);
@@ -1766,6 +2087,19 @@ def _render_html(*, static_payload_json: str) -> str:
           <div class="pill range-pill">
             <div class="range-title">持仓量 &gt; <span id="oiFilterLabel">3</span>M</div>
             <input id="oiFilter" type="range" min="0" max="7" step="1" value="2" />
+          </div>
+          <div class="pill blacklist-pill">
+            <div class="blacklist-title">黑名单 <strong id="blacklistCount">0</strong></div>
+            <div class="blacklist-tools">
+              <label class="toggle-inline blacklist-toggle" title="显示已隐藏">
+                <input id="showBlacklisted" type="checkbox" aria-label="显示已隐藏" />
+                <span class="sr-only">显示已隐藏</span>
+              </label>
+              <div class="tool-actions">
+                <button id="viewBlacklistBtn" class="ghost-btn" type="button">查看黑名单</button>
+                <button id="syncAlertBlacklistBtn" class="ghost-btn" type="button">同步通知</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1808,6 +2142,21 @@ def _render_html(*, static_payload_json: str) -> str:
     </div>
     <div class="footer" id="footerText"></div>
   </div>
+  <div class="modal-backdrop" id="blacklistModal">
+    <div class="modal-panel">
+      <div class="modal-header">
+        <div class="modal-title">
+          <h2>黑名单</h2>
+          <span>仅影响你当前浏览器；备注也只保存在本机</span>
+        </div>
+        <div class="modal-actions">
+          <button id="modalClearBlacklistBtn" class="ghost-btn" type="button">清空黑名单</button>
+          <button id="closeBlacklistBtn" class="ghost-btn" type="button">关闭</button>
+        </div>
+      </div>
+      <div id="blacklistModalBody"></div>
+    </div>
+  </div>
 
   <script>
     const STATIC_PAYLOAD = {static_payload_json};
@@ -1817,6 +2166,8 @@ def _render_html(*, static_payload_json: str) -> str:
     const WINDOW_DAYS_BY_KEY = Object.fromEntries(WINDOWS_META.map(w => [w.key, w.spanMs / 86400000]));
     const STR_COLLATOR = new Intl.Collator(undefined, {{ numeric: true, sensitivity: 'base' }});
     const RENDER_CHUNK_SIZE = 180;
+    const BLACKLIST_STORAGE_KEY = 'funding_dashboard_blacklist_v1';
+    const BLACKLIST_NOTES_STORAGE_KEY = 'funding_dashboard_blacklist_notes_v1';
     const toPct = (v) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(4) + '%';
     const toPctFixed = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : (v * 100).toFixed(digits) + '%';
     const toNum = (v, digits = 2) => v == null || Number.isNaN(v) ? '—' : Number(v).toLocaleString(undefined, {{ maximumFractionDigits: digits }});
@@ -1839,6 +2190,9 @@ def _render_html(*, static_payload_json: str) -> str:
     let sortDir = 'asc';
     let oiThresholdIdx = 2;
     let selectedExchanges = new Set(EXCHANGES_META.map(x => x.key));
+    let blacklistedRowKeys = new Set();
+    let blacklistNotesByKey = {{}};
+    let showBlacklisted = false;
     let exchangeCounts = {{}};
     let exchangeUpdatedAt = {{}};
     let fixedColumnsApplied = false;
@@ -1881,14 +2235,222 @@ def _render_html(*, static_payload_json: str) -> str:
       return items.map(item => {{
         const rawSymbol = String(item.symbol || '');
         const display = displaySymbol(rawSymbol);
+        const rowKey = `${'{'}String(item.exchange || '').toLowerCase(){'}'}::${'{'}rawSymbol.toUpperCase(){'}'}`;
         return {{
           ...item,
           _rawSym: rawSymbol.toUpperCase(),
           _displaySym: display,
           _sortSym: display.toUpperCase(),
           _sortExchange: String(item.exchangeLabel || item.exchange || ''),
+          _rowKey: rowKey,
         }};
       }});
+    }}
+
+    function loadBlacklistedRowKeys() {{
+      try {{
+        const raw = window.localStorage.getItem(BLACKLIST_STORAGE_KEY);
+        if (!raw) return new Set();
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return new Set();
+        return new Set(parsed.filter(value => typeof value === 'string' && value));
+      }} catch (_err) {{
+        return new Set();
+      }}
+    }}
+
+    function persistBlacklistedRowKeys() {{
+      try {{
+        window.localStorage.setItem(BLACKLIST_STORAGE_KEY, JSON.stringify(Array.from(blacklistedRowKeys).sort()));
+      }} catch (_err) {{
+        return;
+      }}
+    }}
+
+    function loadBlacklistNotesByKey() {{
+      try {{
+        const raw = window.localStorage.getItem(BLACKLIST_NOTES_STORAGE_KEY);
+        if (!raw) return {{}};
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {{}};
+        const out = {{}};
+        Object.entries(parsed).forEach(([rowKey, note]) => {{
+          const normalized = typeof rowKey === 'string' ? rowKey : '';
+          if (!normalized || typeof note !== 'string') return;
+          out[normalized] = note;
+        }});
+        return out;
+      }} catch (_err) {{
+        return {{}};
+      }}
+    }}
+
+    function persistBlacklistNotesByKey() {{
+      try {{
+        const payload = {{}};
+        Object.keys(blacklistNotesByKey).sort().forEach(rowKey => {{
+          const note = String(blacklistNotesByKey[rowKey] || '').trim();
+          if (!note) return;
+          payload[rowKey] = note;
+        }});
+        window.localStorage.setItem(BLACKLIST_NOTES_STORAGE_KEY, JSON.stringify(payload));
+      }} catch (_err) {{
+        return;
+      }}
+    }}
+
+    function updateFooterText() {{
+      const footer = document.getElementById('footerText');
+      if (!footer) return;
+      let text = '历史数据 1 小时更新一次，其他数据 10 分钟更新一次';
+      if (blacklistedRowKeys.size) {{
+        text += ` · 黑名单 ${'{'}blacklistedRowKeys.size{'}'} 项`;
+      }}
+      footer.textContent = text;
+    }}
+
+    function describeRowKey(rowKey) {{
+      const [exchange, symbol] = String(rowKey || '').split('::');
+      return {{
+        exchange: exchangeLabel(exchange || ''),
+        symbol: symbol || '',
+      }};
+    }}
+
+    function renderBlacklistModal() {{
+      const body = document.getElementById('blacklistModalBody');
+      if (!body) return;
+      const rowKeys = Array.from(blacklistedRowKeys).sort((a, b) => STR_COLLATOR.compare(a, b));
+      if (!rowKeys.length) {{
+        body.innerHTML = '<div class="empty-blacklist">当前没有黑名单标的</div>';
+        return;
+      }}
+      body.innerHTML = `
+        <table class="modal-table">
+          <thead>
+            <tr>
+              <th style="width: 22%;">交易所</th>
+              <th style="width: 24%;">标的</th>
+              <th>备注</th>
+              <th style="width: 72px;">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${'{'}rowKeys.map(rowKey => {{
+              const entry = describeRowKey(rowKey);
+              const note = String(blacklistNotesByKey[rowKey] || '');
+              return `
+                <tr>
+                  <td>${'{'}entry.exchange{'}'}</td>
+                  <td><span class="tag">${'{'}entry.symbol{'}'}</span></td>
+                  <td>
+                    <input class="note-input" data-note-key="${'{'}rowKey{'}'}" type="text" value="${'{'}note{'}'}" placeholder="备注（仅本机可见）" />
+                  </td>
+                  <td>
+                    <div class="row-actions">
+                      <button type="button" class="ghost-btn" data-remove-blacklist-key="${'{'}rowKey{'}'}">移出</button>
+                    </div>
+                  </td>
+                </tr>
+              `;
+            }}).join(''){'}'}
+          </tbody>
+        </table>
+      `;
+    }}
+
+    function openBlacklistModal() {{
+      renderBlacklistModal();
+      const modal = document.getElementById('blacklistModal');
+      if (modal) modal.classList.add('open');
+    }}
+
+    function closeBlacklistModal() {{
+      const modal = document.getElementById('blacklistModal');
+      if (modal) modal.classList.remove('open');
+    }}
+
+    function updateBlacklistControls() {{
+      const countEl = document.getElementById('blacklistCount');
+      const viewEl = document.getElementById('viewBlacklistBtn');
+      const modalClearEl = document.getElementById('modalClearBlacklistBtn');
+      if (countEl) countEl.textContent = `${'{'}blacklistedRowKeys.size{'}'}`;
+      if (viewEl) viewEl.disabled = false;
+      if (modalClearEl) modalClearEl.disabled = blacklistedRowKeys.size === 0;
+      updateFooterText();
+    }}
+
+    async function syncAlertBlacklistToServer() {{
+      const token = window.prompt('输入服务器设置的管理口令，将当前黑名单同步到服务器通知黑名单。');
+      if (token == null) return false;
+      const trimmed = String(token || '').trim();
+      if (!trimmed) return false;
+      try {{
+        const res = await fetch('/api/alert-blacklist', {{
+          method: 'POST',
+          cache: 'no-store',
+          headers: {{
+            'Content-Type': 'application/json',
+            'X-Dashboard-Admin-Token': trimmed,
+          }},
+          body: JSON.stringify({{ replaceAll: true, rowKeys: Array.from(blacklistedRowKeys).sort() }}),
+        }});
+        if (res.status === 401) {{
+          window.alert('管理口令无效，未同步到服务器。');
+          return false;
+        }}
+        if (!res.ok) {{
+          const payload = await res.json().catch(() => ({{}}));
+          window.alert(`同步通知失败：${'{'}payload.error || res.status{'}'}`);
+          return false;
+        }}
+        window.alert('黑名单已同步到服务器通知黑名单。');
+        return true;
+      }} catch (err) {{
+        window.alert(`同步通知失败：${'{'}err.message{'}'}`);
+        return false;
+      }}
+    }}
+
+    async function toggleBlacklistedRowKey(rowKey) {{
+      if (!rowKey) return;
+      if (blacklistedRowKeys.has(rowKey)) {{
+        blacklistedRowKeys.delete(rowKey);
+        delete blacklistNotesByKey[rowKey];
+      }} else {{
+        blacklistedRowKeys.add(rowKey);
+      }}
+      persistBlacklistedRowKeys();
+      persistBlacklistNotesByKey();
+      updateBlacklistControls();
+      render();
+      if (document.getElementById('blacklistModal')?.classList.contains('open')) {{
+        renderBlacklistModal();
+      }}
+    }}
+
+    async function clearBlacklistedRowKeys() {{
+      if (!blacklistedRowKeys.size) return;
+      blacklistedRowKeys = new Set();
+      blacklistNotesByKey = {{}};
+      persistBlacklistedRowKeys();
+      persistBlacklistNotesByKey();
+      updateBlacklistControls();
+      render({{ preferFullReplace: true }});
+      renderBlacklistModal();
+    }}
+
+    function updateBlacklistNote(rowKey, note) {{
+      const normalized = String(rowKey || '').trim();
+      if (!normalized) return;
+      const value = String(note || '').trim();
+      if (!blacklistedRowKeys.has(normalized)) return;
+      if (value) {{
+        blacklistNotesByKey[normalized] = value;
+      }} else {{
+        delete blacklistNotesByKey[normalized];
+      }}
+      persistBlacklistNotesByKey();
     }}
 
     function allExchangesSelected() {{
@@ -2022,7 +2584,6 @@ def _render_html(*, static_payload_json: str) -> str:
     }}
 
     function updateMeta(payload) {{
-      const footer = document.getElementById('footerText');
       const counts = {{}};
       const updatedMap = {{ ...(payload.exchangeUpdatedAt || {{}}) }};
       dataCache.forEach(it => counts[it.exchange] = (counts[it.exchange] || 0) + 1);
@@ -2036,7 +2597,7 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
       exchangeCounts = counts;
       exchangeUpdatedAt = updatedMap;
-      footer.textContent = '历史数据 1 小时更新一次，其他数据 10 分钟更新一次';
+      updateFooterText();
       renderExchangeChoices();
     }}
 
@@ -2064,6 +2625,7 @@ def _render_html(*, static_payload_json: str) -> str:
     }}
 
     function renderRow(item) {{
+      const isBlacklisted = blacklistedRowKeys.has(item._rowKey);
       const sums = item.sums || {{}};
       const sumsPartial = item.sumsPartial || {{}};
       const sumsCoverageMs = item.sumsCoverageMs || {{}};
@@ -2082,10 +2644,23 @@ def _render_html(*, static_payload_json: str) -> str:
       const notionalDisplay = item.openInterestNotional == null ? null : item.openInterestNotional / 1_000_000;
       const insuranceDisplay = item.insuranceBalance == null ? null : item.insuranceBalance / 1_000_000;
       const latestAnn = item.fundingIntervalHours ? (item.lastFundingRate ?? 0) * (24 / item.fundingIntervalHours) * 365 : null;
+      const rowClass = isBlacklisted ? 'row-blacklisted' : '';
+      const blacklistActionLabel = isBlacklisted ? '恢复' : '拉黑';
+      const blacklistActionTitle = isBlacklisted ? '移出黑名单' : '加入黑名单';
       return `
-        <tr>
+        <tr class="${'{'}rowClass{'}'}">
           <td><span class="tag">${'{'}exchangeLabel(item.exchange){'}'}</span></td>
-          <td><span class="tag">${'{'}item._displaySym || displaySymbol(item.symbol){'}'}</span></td>
+          <td>
+            <div class="symbol-cell">
+              <span class="tag">${'{'}item._displaySym || displaySymbol(item.symbol){'}'}</span>
+              <button
+                type="button"
+                class="row-toggle-btn ${'{'}isBlacklisted ? 'active' : ''{'}'}"
+                data-blacklist-key="${'{'}item._rowKey{'}'}"
+                title="${'{'}blacklistActionTitle{'}'}"
+              >${'{'}blacklistActionLabel{'}'}</button>
+            </div>
+          </td>
           <td class="num">${'{'}formatMarkPrice(item.markPrice){'}'}</td>
           <td class="num">${'{'}toNumFixed(notionalDisplay, 2){'}'}</td>
           <td class="num">${'{'}toNumFixed(insuranceDisplay, 2){'}'}</td>
@@ -2122,6 +2697,7 @@ def _render_html(*, static_payload_json: str) -> str:
       const q = exactSearch ? rawQuery.slice(0, -1).trim() : rawQuery;
       const threshold = OI_THRESHOLDS[oiThresholdIdx] * 1_000_000;
       const filtered = dataCache.filter(item => {{
+        const isBlacklisted = blacklistedRowKeys.has(item._rowKey);
         const hitExchange = selectedExchanges.size > 0 && selectedExchanges.has(item.exchange);
         const rawSym = item._rawSym || '';
         const dispSym = item._sortSym || '';
@@ -2133,7 +2709,7 @@ def _render_html(*, static_payload_json: str) -> str:
         const notional = item.openInterestNotional ?? 0;
         const hideDefaultZeroOiGrvt = item.exchange === 'grvt' && !q && notional <= 0;
         const hitOi = exactSearch && q ? true : notional >= threshold;
-        return hitExchange && hitSymbol && hitOi && !hideDefaultZeroOiGrvt;
+        return hitExchange && hitSymbol && hitOi && !hideDefaultZeroOiGrvt && (!isBlacklisted || showBlacklisted);
       }});
 
       const sorted = filtered.sort((a, b) => {{
@@ -2163,7 +2739,7 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
 
       if (!sorted.length) {{
-        body.innerHTML = '<tr><td colspan="99" class="dim">暂无数据：请先运行采集脚本写入 funding.db</td></tr>';
+        body.innerHTML = '<tr><td colspan="99" class="dim">暂无可显示数据：可能被筛选条件或黑名单隐藏</td></tr>';
         updateSortIndicators();
         return;
       }}
@@ -2224,6 +2800,55 @@ def _render_html(*, static_payload_json: str) -> str:
       if (searchDebounce) clearTimeout(searchDebounce);
       searchDebounce = setTimeout(render, 80);
     }});
+    document.getElementById('table-body').addEventListener('click', (event) => {{
+      const button = event.target.closest('[data-blacklist-key]');
+      if (!button) return;
+      void toggleBlacklistedRowKey(button.dataset.blacklistKey || '');
+    }});
+    document.getElementById('blacklistModalBody').addEventListener('click', (event) => {{
+      const button = event.target.closest('[data-remove-blacklist-key]');
+      if (!button) return;
+      void toggleBlacklistedRowKey(button.dataset.removeBlacklistKey || '');
+    }});
+    document.getElementById('blacklistModalBody').addEventListener('change', (event) => {{
+      const input = event.target.closest('[data-note-key]');
+      if (!input) return;
+      updateBlacklistNote(input.dataset.noteKey || '', input.value || '');
+    }});
+    document.getElementById('blacklistModalBody').addEventListener('focusout', (event) => {{
+      const input = event.target.closest('[data-note-key]');
+      if (!input) return;
+      updateBlacklistNote(input.dataset.noteKey || '', input.value || '');
+    }});
+    document.getElementById('blacklistModalBody').addEventListener('keydown', (event) => {{
+      const input = event.target.closest('[data-note-key]');
+      if (!input || event.key !== 'Enter') return;
+      event.preventDefault();
+      updateBlacklistNote(input.dataset.noteKey || '', input.value || '');
+      input.blur();
+    }});
+    document.getElementById('viewBlacklistBtn').addEventListener('click', () => {{
+      openBlacklistModal();
+    }});
+    document.getElementById('syncAlertBlacklistBtn').addEventListener('click', () => {{
+      void syncAlertBlacklistToServer();
+    }});
+    document.getElementById('closeBlacklistBtn').addEventListener('click', () => {{
+      closeBlacklistModal();
+    }});
+    document.getElementById('modalClearBlacklistBtn').addEventListener('click', () => {{
+      void clearBlacklistedRowKeys();
+    }});
+    document.getElementById('blacklistModal').addEventListener('click', (event) => {{
+      if (event.target?.id === 'blacklistModal') {{
+        closeBlacklistModal();
+      }}
+    }});
+    window.addEventListener('keydown', (event) => {{
+      if (event.key === 'Escape') {{
+        closeBlacklistModal();
+      }}
+    }});
 
     const oiFilter = document.getElementById('oiFilter');
     const oiFilterLabel = document.getElementById('oiFilterLabel');
@@ -2237,6 +2862,10 @@ def _render_html(*, static_payload_json: str) -> str:
       render();
     }});
     updateOiLabel();
+    document.getElementById('showBlacklisted').addEventListener('change', (event) => {{
+      showBlacklisted = !!event.target.checked;
+      render({{ preferFullReplace: true }});
+    }});
 
     document.querySelectorAll('th[data-key]').forEach(th => {{
       th.style.cursor = 'pointer';
@@ -2252,6 +2881,9 @@ def _render_html(*, static_payload_json: str) -> str:
       }});
     }});
     updateSortIndicators();
+    blacklistedRowKeys = loadBlacklistedRowKeys();
+    blacklistNotesByKey = loadBlacklistNotesByKey();
+    updateBlacklistControls();
 
     startAutoRefresh();
     load().catch(err => {{
@@ -2346,6 +2978,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             etag=_etag_for_bytes(data),
         )
 
+    def _dashboard_admin_authorized(self) -> tuple[bool, str]:
+        configured = load_dashboard_admin_token()
+        if not configured:
+            return False, "管理口令未配置"
+        provided = str(self.headers.get("X-Dashboard-Admin-Token") or "").strip()
+        if not provided:
+            return False, "缺少管理口令"
+        if not hmac.compare_digest(provided, configured):
+            return False, "管理口令无效"
+        return True, ""
+
+    def _read_json_body(self) -> dict[str, Any]:
+        length = int(str(self.headers.get("Content-Length") or "0") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(min(length, 64 * 1024))
+        if not raw:
+            return {}
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
     def _log_http_request(
         self,
         *,
@@ -2408,8 +3063,71 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json_bytes(payload_bytes, etag=_etag_for_bytes(payload_bytes))
             self._log_http_request(path=path, started_at=request_started, threshold_ms=SLOW_HTTP_META_MS)
             return
+        if path == "/api/alert-blacklist":
+            ok, message = self._dashboard_admin_authorized()
+            if not ok:
+                status = 503 if message == "管理口令未配置" else 401
+                self._send_json({"error": message}, status=status)
+                return
+            try:
+                row_keys = sorted(load_alert_blacklist_row_keys())
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=500)
+                return
+            self._send_json({"rowKeys": row_keys, "count": len(row_keys)})
+            return
 
         self._send_bytes(b"", status=404, content_type="text/plain; charset=utf-8")
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path != "/api/alert-blacklist":
+            self._send_bytes(b"", status=404, content_type="text/plain; charset=utf-8")
+            return
+        ok, message = self._dashboard_admin_authorized()
+        if not ok:
+            status = 503 if message == "管理口令未配置" else 401
+            self._send_json({"error": message}, status=status)
+            return
+        try:
+            payload = self._read_json_body()
+            clear_all = bool(payload.get("clearAll"))
+            if clear_all:
+                row_keys = sorted(update_alert_blacklist_row_keys(clear_all=True))
+                self._send_json({"ok": True, "rowKeys": row_keys, "count": len(row_keys), "cleared": True})
+                return
+            replace_all = bool(payload.get("replaceAll"))
+            if replace_all:
+                raw_row_keys = payload.get("rowKeys")
+                if not isinstance(raw_row_keys, list):
+                    self._send_json({"error": "invalid rowKeys"}, status=400)
+                    return
+                normalized = {
+                    row_key
+                    for row_key in (normalize_alert_row_key(value) for value in raw_row_keys)
+                    if row_key is not None
+                }
+                row_keys = sorted(update_alert_blacklist_row_keys(replace_all_row_keys=normalized))
+                self._send_json({"ok": True, "rowKeys": row_keys, "count": len(row_keys), "replaced": True})
+                return
+            row_key = normalize_alert_row_key(payload.get("rowKey"))
+            blocked_raw = payload.get("blocked")
+            if row_key is None or not isinstance(blocked_raw, bool):
+                self._send_json({"error": "invalid rowKey/blocked"}, status=400)
+                return
+            row_keys = sorted(update_alert_blacklist_row_keys(row_key=row_key, blocked=blocked_raw))
+            self._send_json(
+                {
+                    "ok": True,
+                    "rowKey": row_key,
+                    "blocked": blocked_raw,
+                    "rowKeys": row_keys,
+                    "count": len(row_keys),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._send_json({"error": str(exc)}, status=500)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         return

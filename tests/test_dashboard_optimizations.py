@@ -258,6 +258,15 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertIn("pollMetaAndRefresh", html)
         self.assertIn("appendRowsInChunks", html)
         self.assertNotIn("choice-state", html)
+        self.assertIn("funding_dashboard_blacklist_v1", html)
+        self.assertIn("viewBlacklistBtn", html)
+        self.assertIn("syncAlertBlacklistBtn", html)
+        self.assertIn("modalClearBlacklistBtn", html)
+        self.assertIn("showBlacklisted", html)
+        self.assertIn("/api/alert-blacklist", html)
+        self.assertNotIn("setAdminTokenBtn", html)
+        self.assertNotIn("data-save-note-key", html)
+        self.assertNotIn("当前只做本机隐藏；未同步飞书告警", html)
 
     def test_alerts_h4_threshold_reads_payload_sums(self) -> None:
         payload = {
@@ -281,6 +290,56 @@ class DashboardOptimizationTests(unittest.TestCase):
         hits = funding_alerts.collect_hits(payload, config)
         self.assertEqual(len(hits), 1)
         self.assertAlmostEqual(hits[0].h4_value or 0.0, 0.0035)
+
+    def test_alert_blacklist_api_blocks_alert_hits(self) -> None:
+        self._seed_demo_data()
+        server = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard.DashboardHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with mock.patch.object(dashboard, "load_dashboard_admin_token", return_value="secret-token"):
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+                conn.request(
+                    "POST",
+                    "/api/alert-blacklist",
+                    body=json.dumps({"rowKey": "demo::BTC_USDT", "blocked": True}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Dashboard-Admin-Token": "secret-token",
+                    },
+                )
+                resp = conn.getresponse()
+                payload = json.loads(resp.read())
+                self.assertEqual(resp.status, 200)
+                self.assertTrue(payload["ok"])
+                conn.close()
+
+            blocked = dashboard.load_alert_blacklist_row_keys()
+            self.assertEqual(blocked, {"demo::BTC_USDT"})
+            hits = funding_alerts.collect_hits(
+                {
+                    "generatedAt": self.now_ms,
+                    "items": [
+                        {
+                            "exchange": "demo",
+                            "exchangeLabel": "Demo",
+                            "symbol": "BTC_USDT",
+                            "fundingIntervalHours": 8,
+                            "openInterestNotional": 5_000_000,
+                            "lastFundingRate": 0.002,
+                            "sums": {"h4": 0.0035},
+                        }
+                    ],
+                },
+                {"latest_pct_gte": 0.1},
+                blocked_row_keys=blocked,
+            )
+            self.assertEqual(hits, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_alerts_do_not_apply_cooldown_between_runs(self) -> None:
         payload = {

@@ -6,6 +6,7 @@
   "latest_pct_lte": null,
   "h4_pct_gte": 0.2,
   "h4_pct_lte": null,
+  "dashboard_admin_token": "",
   "providers": {
     "telegram": {
       "enabled": false,
