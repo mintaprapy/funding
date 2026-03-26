@@ -263,6 +263,8 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertIn("syncAlertBlacklistBtn", html)
         self.assertIn("modalClearBlacklistBtn", html)
         self.assertIn("showBlacklisted", html)
+        self.assertIn("exchange-choice.abnormal", html)
+        self.assertIn("exchangeFreshness", html)
         self.assertIn("/api/alert-blacklist", html)
         self.assertNotIn("setAdminTokenBtn", html)
         self.assertNotIn("data-save-note-key", html)

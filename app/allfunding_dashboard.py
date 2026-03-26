@@ -1688,6 +1688,19 @@ def _render_html(*, static_payload_json: str) -> str:
       background: rgba(34,211,238,0.12);
       border-color: rgba(34,211,238,0.45);
     }}
+    .exchange-choice.abnormal {{
+      background: rgba(239, 68, 68, 0.06);
+      border-color: rgba(239, 68, 68, 0.22);
+    }}
+    .exchange-choice.abnormal.active {{
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.3);
+    }}
+    .exchange-choice.abnormal .choice-text,
+    .exchange-choice.abnormal .choice-count,
+    .exchange-choice.abnormal .choice-meta {{
+      color: #fbc5c5;
+    }}
     .exchange-main {{
       display: inline-flex;
       align-items: center;
@@ -2195,6 +2208,7 @@ def _render_html(*, static_payload_json: str) -> str:
     let showBlacklisted = false;
     let exchangeCounts = {{}};
     let exchangeUpdatedAt = {{}};
+    let exchangeFreshness = {{}};
     let fixedColumnsApplied = false;
     let renderVersion = 0;
     let scheduledRender = null;
@@ -2477,17 +2491,18 @@ def _render_html(*, static_payload_json: str) -> str:
       if (!group) return;
       const totalCount = dataCache.length;
       const items = [
-        {{ key: 'all', label: '全部', count: totalCount, checked: allExchangesSelected(), meta: '' }},
+        {{ key: 'all', label: '全部', count: totalCount, checked: allExchangesSelected(), meta: '', abnormal: false }},
         ...EXCHANGES_META.map(x => ({{
           key: x.key,
           label: x.label,
           count: exchangeCounts[x.key] || 0,
           checked: selectedExchanges.has(x.key),
           meta: formatExchangeUpdatedAt(exchangeUpdatedAt[x.key]),
+          abnormal: !!(exchangeFreshness[x.key] && exchangeFreshness[x.key].status && exchangeFreshness[x.key].status !== 'fresh'),
         }})),
       ];
       group.innerHTML = items.map(item => `
-        <div class="exchange-choice ${'{'}item.checked ? 'active' : ''{'}'}" data-key="${'{'}item.key{'}'}">
+        <div class="exchange-choice ${'{'}item.checked ? 'active' : ''{'}'} ${'{'}item.abnormal ? 'abnormal' : ''{'}'}" data-key="${'{'}item.key{'}'}">
           <label class="exchange-main">
             <input type="checkbox" ${'{'}item.checked ? 'checked' : ''{'}'} />
             <span class="exchange-copy">
@@ -2586,6 +2601,7 @@ def _render_html(*, static_payload_json: str) -> str:
     function updateMeta(payload) {{
       const counts = {{}};
       const updatedMap = {{ ...(payload.exchangeUpdatedAt || {{}}) }};
+      exchangeFreshness = {{ ...(payload.exchangeFreshness || {{}}) }};
       dataCache.forEach(it => counts[it.exchange] = (counts[it.exchange] || 0) + 1);
       dataCache.forEach(it => {{
         if (it.updated_at == null) return;
