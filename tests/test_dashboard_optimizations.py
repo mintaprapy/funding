@@ -131,6 +131,7 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertAlmostEqual(item["markPrice"], 123.45)
         self.assertAlmostEqual(item["lastFundingRate"], 0.0025)
         self.assertEqual(payload["exchangeFreshness"]["demo"]["status"], "fresh")
+        self.assertIsNone(item["tradeUrl"])
 
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -253,6 +254,53 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertEqual(freshness["lag"]["status"], "lagging")
         self.assertEqual(freshness["old"]["status"], "stale")
 
+    def test_trade_page_url_builders(self) -> None:
+        self.assertEqual(
+            dashboard.trade_page_url("binance", "BTCUSDT"),
+            "https://www.binance.com/en/futures/BTCUSDT",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("backpack", "BTC_USDC_PERP"),
+            "https://backpack.exchange/trade/BTC_USD_PERP",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("hyperliquid", "ETH"),
+            "https://app.hyperliquid.xyz/trade/ETH",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("hyperliquid", "flx:CRCL"),
+            "https://app.hyperliquid.xyz/trade/flx:CRCL",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("aster", "BTCUSDT"),
+            "https://www.asterdex.com/en/trade/pro/futures/BTCUSDT",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("gate", "BTC_USDT"),
+            "https://www.gate.com/futures/USDT/BTC_USDT",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("grvt", "SOL_USDT_Perp"),
+            "https://grvt.io/exchange/perpetual/SOL-USDT",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("ethereal", "BTCUSD"),
+            "https://app.ethereal.trade/BTCUSD",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("standx", "BTC-USD"),
+            "https://standx.com/perps?symbol=BTC-USD",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("lighter", "ZEC"),
+            "https://app.lighter.xyz/trade/ZEC",
+        )
+        self.assertEqual(
+            dashboard.trade_page_url("variational", "BTC"),
+            "https://omni.variational.io/perpetual/BTC",
+        )
+        self.assertIsNone(dashboard.trade_page_url("", "BTCUSDT"))
+
     def test_render_html_contains_virtualized_table_markers(self) -> None:
         html = dashboard.render_html()
         self.assertIn("pollMetaAndRefresh", html)
@@ -265,6 +313,8 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertIn("showBlacklisted", html)
         self.assertIn("exchange-choice.abnormal", html)
         self.assertIn("exchangeFreshness", html)
+        self.assertIn("symbol-link", html)
+        self.assertIn("tradeUrl", html)
         self.assertIn("/api/alert-blacklist", html)
         self.assertNotIn("setAdminTokenBtn", html)
         self.assertNotIn("data-save-note-key", html)

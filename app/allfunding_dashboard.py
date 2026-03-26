@@ -16,7 +16,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -99,6 +99,17 @@ HISTORY_SUMMARIES_WINDOW_SIG_KEY = "history_summaries_window_sig"
 HISTORY_SUMMARIES_BATCH_COMPLETED_AT_KEY = "history_summaries_batch_completed_at"
 HISTORY_SUMMARIES_ANCHOR_MS_KEY = "history_summaries_anchor_ms"
 ALERT_BLACKLIST_META_KEY = "alert_row_blacklist_v1"
+DISPLAY_SYMBOL_SUFFIXES = (
+    "_USDT_PERP",
+    "_USDC_PERP",
+    "_USD_PERP",
+    "_USDT",
+    "_USDC",
+    "_USD",
+    "_PERP",
+    "USDT",
+    "USDC",
+)
 
 
 def _to_number(val: Any) -> float | None:
@@ -165,6 +176,66 @@ def _to_int(val: Any) -> int | None:
         return int(val)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_symbol_text(symbol: Any) -> str:
+    return str(symbol or "").strip().upper()
+
+
+def display_symbol_for_trade(symbol: Any) -> str:
+    normalized = _normalize_symbol_text(symbol)
+    for suffix in DISPLAY_SYMBOL_SUFFIXES:
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+    return normalized
+
+
+def _grvt_trade_symbol(symbol: Any) -> str:
+    normalized = _normalize_symbol_text(symbol)
+    if normalized.endswith("_PERP"):
+        normalized = normalized[:-5]
+    return normalized.replace("_", "-")
+
+
+def trade_page_url(exchange: Any, symbol: Any) -> str | None:
+    exchange_key = str(exchange or "").strip().lower()
+    original_symbol = str(symbol or "").strip()
+    raw_symbol = _normalize_symbol_text(symbol)
+    if not exchange_key or not raw_symbol:
+        return None
+
+    display_symbol = display_symbol_for_trade(raw_symbol)
+    quoted_raw_symbol = quote(raw_symbol, safe="")
+    quoted_display_symbol = quote(display_symbol, safe="")
+
+    if exchange_key == "binance":
+        return f"https://www.binance.com/en/futures/{quoted_raw_symbol}"
+    if exchange_key == "bybit":
+        return f"https://www.bybit.com/trade/usdt/{quoted_raw_symbol}"
+    if exchange_key == "aster":
+        return f"https://www.asterdex.com/en/trade/pro/futures/{quoted_raw_symbol}"
+    if exchange_key == "hyperliquid":
+        trade_symbol = original_symbol or raw_symbol
+        return f"https://app.hyperliquid.xyz/trade/{quote(trade_symbol, safe=':')}"
+    if exchange_key == "backpack":
+        return f"https://backpack.exchange/trade/{quote(f'{display_symbol}_USD_PERP', safe='')}"
+    if exchange_key == "ethereal":
+        return f"https://app.ethereal.trade/{quoted_raw_symbol}"
+    if exchange_key == "grvt":
+        return f"https://grvt.io/exchange/perpetual/{quote(_grvt_trade_symbol(raw_symbol), safe='')}"
+    if exchange_key == "standx":
+        return f"https://standx.com/perps?symbol={quoted_raw_symbol}"
+    if exchange_key == "lighter":
+        return f"https://app.lighter.xyz/trade/{quoted_display_symbol}"
+    if exchange_key == "gate":
+        return f"https://www.gate.com/futures/USDT/{quoted_raw_symbol}"
+    if exchange_key == "bitget":
+        return f"https://www.bitget.com/futures/usdt/{quoted_raw_symbol}"
+    if exchange_key == "variational":
+        return f"https://omni.variational.io/perpetual/{quoted_display_symbol}"
+    if exchange_key == "edgex":
+        return f"https://pro.edgex.exchange/?symbol={quoted_raw_symbol}"
+    return None
 
 
 def merge_windows(extra_windows: tuple[WindowDef, ...] | None = None) -> tuple[WindowDef, ...]:
@@ -1291,6 +1362,7 @@ def _build_payload_uncached(
                         **row,
                         "exchange": exchange,
                         "exchangeLabel": str(meta["label"]),
+                        "tradeUrl": trade_page_url(exchange, row["symbol"]),
                         "openInterestNotional": notional,
                         "sums": dict(sum_bundle["values"]),
                         "sumsPartial": dict(sum_bundle["partial"]),
@@ -1935,6 +2007,16 @@ def _render_html(*, static_payload_json: str) -> str:
       font-size: 12px;
       border: 1px solid var(--border);
       background: rgba(255,255,255,0.03);
+    }}
+    .symbol-link {{
+      color: inherit;
+      text-decoration: none;
+      transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+    }}
+    .symbol-link:hover {{
+      background: rgba(34,211,238,0.1);
+      border-color: rgba(34,211,238,0.38);
+      transform: translateY(-1px);
     }}
     .stack {{
       display: flex;
@@ -2645,6 +2727,10 @@ def _render_html(*, static_payload_json: str) -> str:
       const sums = item.sums || {{}};
       const sumsPartial = item.sumsPartial || {{}};
       const sumsCoverageMs = item.sumsCoverageMs || {{}};
+      const symbolText = item._displaySym || displaySymbol(item.symbol);
+      const symbolTag = item.tradeUrl
+        ? `<a class="tag symbol-link" href="${'{'}item.tradeUrl{'}'}" target="_blank" rel="noopener noreferrer" title="打开 ${'{'}symbolText{'}'} 交易页">${'{'}symbolText{'}'}</a>`
+        : `<span class="tag">${'{'}symbolText{'}'}</span>`;
       const windowCells = WINDOW_KEYS.map(key => {{
         const v = sums[key];
         const partial = !!sumsPartial[key];
@@ -2668,7 +2754,7 @@ def _render_html(*, static_payload_json: str) -> str:
           <td><span class="tag">${'{'}exchangeLabel(item.exchange){'}'}</span></td>
           <td>
             <div class="symbol-cell">
-              <span class="tag">${'{'}item._displaySym || displaySymbol(item.symbol){'}'}</span>
+              ${'{'}symbolTag{'}'}
               <button
                 type="button"
                 class="row-toggle-btn ${'{'}isBlacklisted ? 'active' : ''{'}'}"
