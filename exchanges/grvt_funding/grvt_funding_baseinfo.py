@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -175,14 +176,30 @@ def _extract_interval_hours(item: dict[str, Any]) -> int:
     return DEFAULT_FUNDING_INTERVAL_HOURS
 
 
+def sum_plain_values(*values: Any) -> str | None:
+    total = Decimal("0")
+    has_value = False
+    for value in values:
+        plain = to_plain_str(value)
+        if plain is None:
+            continue
+        try:
+            total += Decimal(plain)
+            has_value = True
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+    return to_plain_str(total) if has_value else None
+
+
 def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
     conn.executemany(
         f"""
         INSERT INTO {TABLE_NAME} (
             symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
-            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance, updated_at
+            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance,
+            volume24h, turnover24h, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             adjustedFundingRateCap=excluded.adjustedFundingRateCap,
             adjustedFundingRateFloor=excluded.adjustedFundingRateFloor,
@@ -191,6 +208,8 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
             lastFundingRate=excluded.lastFundingRate,
             openInterest=excluded.openInterest,
             insuranceBalance=excluded.insuranceBalance,
+            volume24h=excluded.volume24h,
+            turnover24h=excluded.turnover24h,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -232,6 +251,8 @@ def main() -> None:
                     pct_to_decimal_str(ticker.get("funding_rate") or ticker.get("funding")),
                     open_interest,
                     None,
+                    sum_plain_values(ticker.get("buy_volume_24h_b"), ticker.get("sell_volume_24h_b")),
+                    sum_plain_values(ticker.get("buy_volume_24h_q"), ticker.get("sell_volume_24h_q")),
                     now_ms,
                 )
             )

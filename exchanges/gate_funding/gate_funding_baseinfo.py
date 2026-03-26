@@ -163,9 +163,10 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
         f"""
         INSERT INTO {TABLE_NAME} (
             symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
-            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance, updated_at
+            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance,
+            volume24h, turnover24h, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             adjustedFundingRateCap=excluded.adjustedFundingRateCap,
             adjustedFundingRateFloor=excluded.adjustedFundingRateFloor,
@@ -174,6 +175,8 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
             lastFundingRate=excluded.lastFundingRate,
             openInterest=excluded.openInterest,
             insuranceBalance=excluded.insuranceBalance,
+            volume24h=excluded.volume24h,
+            turnover24h=excluded.turnover24h,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -220,6 +223,8 @@ def main() -> None:
                     last_rate,
                     calc_open_interest_notional(contract, ticker),
                     insurance_balance,
+                    to_plain_str((ticker or {}).get("volume_24h_base") or (ticker or {}).get("volume_24h")),
+                    to_plain_str((ticker or {}).get("volume_24h_quote") or (ticker or {}).get("volume_24h_settle")),
                     normalize_ts_to_ms(now_ms),
                 )
             )

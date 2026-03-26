@@ -185,11 +185,15 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             lastFundingRate TEXT,
             openInterest TEXT,
             insuranceBalance TEXT,
+            volume24h TEXT,
+            turnover24h TEXT,
             updated_at INTEGER
         )
         """
     )
     ensure_column(conn, TABLE_NAME, "insuranceBalance", "TEXT")
+    ensure_column(conn, TABLE_NAME, "volume24h", "TEXT")
+    ensure_column(conn, TABLE_NAME, "turnover24h", "TEXT")
     conn.commit()
 
 
@@ -211,9 +215,10 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
         f"""
         INSERT INTO {TABLE_NAME} (
             symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
-            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance, updated_at
+            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance,
+            volume24h, turnover24h, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             adjustedFundingRateCap=excluded.adjustedFundingRateCap,
             adjustedFundingRateFloor=excluded.adjustedFundingRateFloor,
@@ -222,6 +227,8 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
             lastFundingRate=excluded.lastFundingRate,
             openInterest=excluded.openInterest,
             insuranceBalance=excluded.insuranceBalance,
+            volume24h=excluded.volume24h,
+            turnover24h=excluded.turnover24h,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -258,6 +265,14 @@ def extract_open_interest_notional(ctx: dict[str, Any], mark_price: str | None) 
         return None
 
 
+def extract_volume_24h(ctx: dict[str, Any]) -> str | None:
+    return to_plain_str(ctx.get("dayBaseVlm") or ctx.get("dayBaseVolume"))
+
+
+def extract_turnover_24h(ctx: dict[str, Any]) -> str | None:
+    return to_plain_str(ctx.get("dayNtlVlm") or ctx.get("dayNotionalVolume"))
+
+
 def main() -> None:
     now_ms = int(time.time() * 1000)
     with requests.Session() as session:
@@ -278,6 +293,8 @@ def main() -> None:
                     extract_last_funding_rate(ctx),
                     extract_open_interest_notional(ctx, mark_price),
                     None,
+                    extract_volume_24h(ctx),
+                    extract_turnover_24h(ctx),
                     now_ms,
                 )
             )

@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
+import requests
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -65,6 +67,17 @@ SLOW_HTTP_META_MS = 1500.0
 SLOW_HTTP_DATA_MS = 5000.0
 BASEINFO_INTERVAL_MS = 10 * 60 * 1000
 EXCHANGE_FRESH_LAG_MS = 2 * 60 * 1000
+ALPHA_CHAIN_LIQUIDITY_ENABLED = os.getenv("FUNDING_ALPHA_CHAIN_LIQUIDITY", "1").strip().lower() not in {
+    "",
+    "0",
+    "false",
+    "no",
+}
+ALPHA_TOKEN_LIST_URL = (
+    "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
+)
+ALPHA_CHAIN_LIQUIDITY_CACHE_TTL_SEC = 10 * 60.0
+ALPHA_REQUEST_TIMEOUT_SEC = 8
 
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_PREPARED = False
@@ -85,6 +98,10 @@ _HISTORY_SUMS_CACHE_LOCK = threading.Lock()
 _HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT: int | None = None
 _HISTORY_SUMS_CACHE_ANCHOR_MS: int | None = None
 _HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE: tuple[tuple[str, int], ...] | None = None
+
+_ALPHA_CHAIN_LIQUIDITY_LOCK = threading.Lock()
+_ALPHA_CHAIN_LIQUIDITY_CACHE: dict[str, dict[str, Any]] | None = None
+_ALPHA_CHAIN_LIQUIDITY_CACHE_TS = 0.0
 _HISTORY_SUMS_CACHE: dict[str, dict[str, dict[str, Any]]] | None = None
 
 _LEGACY_MIGRATIONS_LOCK = threading.Lock()
@@ -109,6 +126,21 @@ DISPLAY_SYMBOL_SUFFIXES = (
     "_PERP",
     "USDT",
     "USDC",
+)
+ALPHA_SYMBOL_SUFFIXES = (
+    "_USDT_PERP",
+    "_USDC_PERP",
+    "_USD_PERP",
+    "-USDT",
+    "-USDC",
+    "-USD",
+    "_USDT",
+    "_USDC",
+    "_USD",
+    "_PERP",
+    "USDT",
+    "USDC",
+    "USD",
 )
 
 
@@ -190,6 +222,161 @@ def display_symbol_for_trade(symbol: Any) -> str:
     return normalized
 
 
+def alpha_symbol_for_market(symbol: Any) -> str | None:
+    normalized = _normalize_symbol_text(symbol)
+    if not normalized:
+        return None
+    for suffix in ALPHA_SYMBOL_SUFFIXES:
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    if ":" in normalized:
+        normalized = normalized.split(":", 1)[1]
+    normalized = normalized.strip("_- ")
+    return normalized or None
+
+
+def _alpha_chain_slug(chain_name: Any, chain_id: Any) -> str | None:
+    normalized_name = str(chain_name or "").strip().lower()
+    if normalized_name == "bsc":
+        return "bsc"
+    if normalized_name == "base":
+        return "base"
+    if normalized_name == "solana":
+        return "solana"
+    if normalized_name == "ethereum":
+        return "ethereum"
+    if normalized_name == "sui":
+        return "sui"
+    if normalized_name == "sonic":
+        return "sonic"
+    if normalized_name == "arbitrum":
+        return "arbitrum"
+    if normalized_name == "tron":
+        return "tron"
+    if normalized_name == "linea":
+        return "linea"
+    slug = "".join(ch for ch in normalized_name if ch.isalnum() or ch in ("-", "_"))
+    if slug:
+        return slug
+    normalized_id = str(chain_id or "").strip().lower()
+    return normalized_id or None
+
+
+def _is_spot_listed_alpha_token(item: dict[str, Any]) -> bool:
+    return bool(item.get("listingCex"))
+
+
+def _fetch_binance_alpha_liquidity_map() -> dict[str, dict[str, Any]]:
+    resp = requests.get(ALPHA_TOKEN_LIST_URL, timeout=ALPHA_REQUEST_TIMEOUT_SEC)
+    resp.raise_for_status()
+    payload = resp.json()
+    items = payload.get("data")
+    if not isinstance(items, list):
+        raise RuntimeError("Binance Alpha token list 返回格式异常（缺少 data 列表）")
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _is_spot_listed_alpha_token(item):
+            continue
+        alpha_symbol = _normalize_symbol_text(item.get("symbol"))
+        if not alpha_symbol:
+            continue
+        liquidity = _to_number(item.get("liquidity"))
+        if liquidity is None:
+            continue
+        entry = grouped.setdefault(
+            alpha_symbol,
+            {
+                "alphaSymbol": alpha_symbol,
+                "alphaChainLiquidity": 0.0,
+                "_chainNames": set(),
+                "_contracts": [],
+            },
+        )
+        entry["alphaChainLiquidity"] += liquidity
+        chain_name = str(item.get("chainName") or "").strip()
+        if chain_name:
+            entry["_chainNames"].add(chain_name)
+        contract_address = str(item.get("contractAddress") or "").strip()
+        chain_id = str(item.get("chainId") or "").strip()
+        if contract_address:
+            entry["_contracts"].append(
+                {
+                    "chainId": chain_id,
+                    "chainName": chain_name,
+                    "contractAddress": contract_address,
+                    "liquidity": liquidity,
+                }
+            )
+
+    out: dict[str, dict[str, Any]] = {}
+    for alpha_symbol, entry in grouped.items():
+        alpha_page_url = None
+        if entry["_contracts"]:
+            best_contract = max(entry["_contracts"], key=lambda item: float(item.get("liquidity") or 0.0))
+            chain_slug = _alpha_chain_slug(best_contract.get("chainName"), best_contract.get("chainId"))
+            contract_address = str(best_contract.get("contractAddress") or "").strip()
+            if chain_slug and contract_address:
+                alpha_page_url = (
+                    f"https://www.binance.com/zh-CN/alpha/{quote(chain_slug, safe='')}/"
+                    f"{quote(contract_address, safe='')}"
+                )
+        out[alpha_symbol] = {
+            "alphaSymbol": alpha_symbol,
+            "alphaChainLiquidity": float(entry["alphaChainLiquidity"]),
+            "alphaChainNames": sorted(entry["_chainNames"]),
+            "alphaContracts": sorted(
+                entry["_contracts"],
+                key=lambda item: (
+                    str(item.get("chainName") or ""),
+                    str(item.get("contractAddress") or ""),
+                ),
+            ),
+            "alphaPageUrl": alpha_page_url,
+        }
+    return out
+
+
+def get_binance_alpha_liquidity_map(*, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    global _ALPHA_CHAIN_LIQUIDITY_CACHE
+    global _ALPHA_CHAIN_LIQUIDITY_CACHE_TS
+
+    if not ALPHA_CHAIN_LIQUIDITY_ENABLED:
+        return {}
+
+    now = time.monotonic()
+    with _ALPHA_CHAIN_LIQUIDITY_LOCK:
+        if (
+            not force_refresh
+            and _ALPHA_CHAIN_LIQUIDITY_CACHE is not None
+            and now - _ALPHA_CHAIN_LIQUIDITY_CACHE_TS < ALPHA_CHAIN_LIQUIDITY_CACHE_TTL_SEC
+        ):
+            return _ALPHA_CHAIN_LIQUIDITY_CACHE
+
+        stale = _ALPHA_CHAIN_LIQUIDITY_CACHE or {}
+        try:
+            data = _fetch_binance_alpha_liquidity_map()
+        except Exception as exc:  # noqa: BLE001
+            if stale:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] "
+                    f"刷新 Binance Alpha 链上流动性失败，继续使用旧缓存：{exc}"
+                )
+                return stale
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][warn] "
+                f"获取 Binance Alpha 链上流动性失败：{exc}"
+            )
+            return {}
+
+        _ALPHA_CHAIN_LIQUIDITY_CACHE = data
+        _ALPHA_CHAIN_LIQUIDITY_CACHE_TS = now
+        return data
+
+
 def _grvt_trade_symbol(symbol: Any) -> str:
     normalized = _normalize_symbol_text(symbol)
     if normalized.endswith("_PERP"):
@@ -209,7 +396,7 @@ def trade_page_url(exchange: Any, symbol: Any) -> str | None:
     quoted_display_symbol = quote(display_symbol, safe="")
 
     if exchange_key == "binance":
-        return f"https://www.binance.com/en/futures/{quoted_raw_symbol}"
+        return f"https://www.binance.com/zh-CN/futures/{quoted_raw_symbol}"
     if exchange_key == "bybit":
         return f"https://www.bybit.com/trade/usdt/{quoted_raw_symbol}"
     if exchange_key == "aster":
@@ -877,11 +1064,15 @@ def ensure_info_table(conn: sqlite3.Connection, table: str) -> None:
             lastFundingRate TEXT,
             openInterest TEXT,
             insuranceBalance TEXT,
+            volume24h TEXT,
+            turnover24h TEXT,
             updated_at INTEGER
         )
         """
     )
     ensure_column(conn, table, "insuranceBalance", "TEXT")
+    ensure_column(conn, table, "volume24h", "TEXT")
+    ensure_column(conn, table, "turnover24h", "TEXT")
     ensure_baseinfo_numeric_layout(conn, table)
 
 
@@ -944,6 +1135,8 @@ def fetch_base_info(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]
                COALESCE(lastFundingRateNum, CASE WHEN lastFundingRate IS NULL OR TRIM(lastFundingRate) = '' THEN NULL ELSE CAST(lastFundingRate AS REAL) END) AS lastFundingRate,
                COALESCE(openInterestNum, CASE WHEN openInterest IS NULL OR TRIM(openInterest) = '' THEN NULL ELSE CAST(openInterest AS REAL) END) AS openInterest,
                COALESCE(insuranceBalanceNum, CASE WHEN insuranceBalance IS NULL OR TRIM(insuranceBalance) = '' THEN NULL ELSE CAST(insuranceBalance AS REAL) END) AS insuranceBalance,
+               COALESCE(volume24hNum, CASE WHEN volume24h IS NULL OR TRIM(volume24h) = '' THEN NULL ELSE CAST(volume24h AS REAL) END) AS volume24h,
+               COALESCE(turnover24hNum, CASE WHEN turnover24h IS NULL OR TRIM(turnover24h) = '' THEN NULL ELSE CAST(turnover24h AS REAL) END) AS turnover24h,
                updated_at
         FROM {table}
         ORDER BY symbol
@@ -961,6 +1154,8 @@ def fetch_base_info(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]
                 "lastFundingRate": _to_number(row["lastFundingRate"]),
                 "openInterest": _to_number(row["openInterest"]),
                 "insuranceBalance": _to_number(row["insuranceBalance"]),
+                "volume24h": _to_number(row["volume24h"]),
+                "turnover24h": _to_number(row["turnover24h"]),
                 "updated_at": row["updated_at"],
             }
         )
@@ -1328,6 +1523,7 @@ def _build_payload_uncached(
             windows=windows,
         )
         history_sums_ms = (time.perf_counter() - stage_started) * 1000.0
+        alpha_liquidity_by_symbol = get_binance_alpha_liquidity_map()
         fallback_exchange_updated_at: dict[str, int] = {}
         for exchange, meta in EXCHANGES.items():
             info_table = _INFO_TABLE_BY_EXCHANGE.get(exchange)
@@ -1357,6 +1553,7 @@ def _build_payload_uncached(
                 multiplier = _to_number(meta.get("open_interest_notional_multiplier")) or 1.0
                 if notional is not None:
                     notional *= multiplier
+                alpha_meta = alpha_liquidity_by_symbol.get(alpha_symbol_for_market(row["symbol"]) or "")
                 items.append(
                     {
                         **row,
@@ -1364,6 +1561,13 @@ def _build_payload_uncached(
                         "exchangeLabel": str(meta["label"]),
                         "tradeUrl": trade_page_url(exchange, row["symbol"]),
                         "openInterestNotional": notional,
+                        "volume24h": row.get("volume24h"),
+                        "turnover24h": row.get("turnover24h"),
+                        "alphaSymbol": None if alpha_meta is None else alpha_meta["alphaSymbol"],
+                        "alphaChainLiquidity": None if alpha_meta is None else alpha_meta["alphaChainLiquidity"],
+                        "alphaChainNames": [] if alpha_meta is None else list(alpha_meta["alphaChainNames"]),
+                        "alphaContracts": [] if alpha_meta is None else list(alpha_meta["alphaContracts"]),
+                        "alphaPageUrl": None if alpha_meta is None else alpha_meta["alphaPageUrl"],
                         "sums": dict(sum_bundle["values"]),
                         "sumsPartial": dict(sum_bundle["partial"]),
                         "sumsCoverageMs": dict(sum_bundle["coverageMs"]),
@@ -2018,6 +2222,46 @@ def _render_html(*, static_payload_json: str) -> str:
       border-color: rgba(34,211,238,0.38);
       transform: translateY(-1px);
     }}
+    .alpha-link {{
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px dotted rgba(34,211,238,0.45);
+      transition: border-color 140ms ease, color 140ms ease;
+    }}
+    .alpha-link:hover {{
+      color: var(--accent);
+      border-bottom-color: rgba(34,211,238,0.9);
+    }}
+    .alpha-tooltip-cell {{
+      position: relative;
+    }}
+    .alpha-tooltip-bubble {{
+      position: absolute;
+      right: 0;
+      top: calc(100% + 6px);
+      display: none;
+      max-width: none;
+      padding: 7px 9px;
+      border-radius: 8px;
+      border: 1px solid rgba(34,211,238,0.28);
+      background: rgba(6, 11, 24, 0.96);
+      box-shadow: 0 10px 28px rgba(0,0,0,0.35);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.2;
+      pointer-events: none;
+      z-index: 5;
+    }}
+    .alpha-tooltip-cell:hover .alpha-tooltip-bubble,
+    .alpha-tooltip-cell:focus-within .alpha-tooltip-bubble {{
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
+    }}
+    .alpha-tooltip-line {{
+      white-space: nowrap;
+    }}
     .stack {{
       display: flex;
       flex-direction: column;
@@ -2212,6 +2456,8 @@ def _render_html(*, static_payload_json: str) -> str:
           <col data-key="exchange" />
           <col data-key="symbol" />
           <col data-key="markPrice" />
+          <col data-key="turnover24h" />
+          <col data-key="alphaChainLiquidity" />
           <col data-key="openInterestNotional" />
           <col data-key="insuranceBalance" />
           <col data-key="lastFundingRate" />
@@ -2224,8 +2470,10 @@ def _render_html(*, static_payload_json: str) -> str:
             <th data-key="exchange" data-label="交易所">交易所</th>
             <th data-key="symbol" data-label="交易对">交易对</th>
             <th data-key="markPrice" data-label="标记价格">标记价格</th>
-            <th data-key="openInterestNotional" data-label="持仓量(M$)">持仓量(M$)</th>
-            <th data-key="insuranceBalance" data-label="风险金(M)">风险金(M)</th>
+            <th data-key="turnover24h" data-label="24H成交额M">24H成交额M</th>
+            <th data-key="alphaChainLiquidity" data-label="Alpha">Alpha</th>
+            <th data-key="openInterestNotional" data-label="持仓量M">持仓量M</th>
+            <th data-key="insuranceBalance" data-label="风险金M">风险金M</th>
             <th data-key="lastFundingRate" data-label="最新资金费率">最新资金费率</th>
             <th data-key="fundingIntervalHours" data-label="周期">周期</th>
             <th data-key="bounds" data-label="上下限">上下限</th>
@@ -2325,6 +2573,14 @@ def _render_html(*, static_payload_json: str) -> str:
         }}
       }}
       return s;
+    }}
+
+    function escapeHtml(value) {{
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('\"', '&quot;');
     }}
 
     function prepareItems(items) {{
@@ -2702,7 +2958,7 @@ def _render_html(*, static_payload_json: str) -> str:
     function getSortValue(item, key) {{
       if (!key || key === 'symbol') return item._sortSym || '';
       if (key === 'exchange') return item._sortExchange || '';
-      if (['lastFundingRate', 'openInterestNotional', 'insuranceBalance', 'markPrice', 'fundingIntervalHours', 'adjustedFundingRateCap', 'adjustedFundingRateFloor'].includes(key)) {{
+      if (['lastFundingRate', 'openInterestNotional', 'insuranceBalance', 'alphaChainLiquidity', 'turnover24h', 'markPrice', 'fundingIntervalHours', 'adjustedFundingRateCap', 'adjustedFundingRateFloor'].includes(key)) {{
         return item[key] == null ? null : Number(item[key]);
       }}
       if (key === 'bounds') {{
@@ -2745,10 +3001,28 @@ def _render_html(*, static_payload_json: str) -> str:
       }}).join('');
       const notionalDisplay = item.openInterestNotional == null ? null : item.openInterestNotional / 1_000_000;
       const insuranceDisplay = item.insuranceBalance == null ? null : item.insuranceBalance / 1_000_000;
+      const alphaLiquidityDisplay = item.alphaChainLiquidity == null ? null : item.alphaChainLiquidity / 1_000_000;
+      const turnoverDisplay = item.turnover24h == null ? null : item.turnover24h / 1_000_000;
       const latestAnn = item.fundingIntervalHours ? (item.lastFundingRate ?? 0) * (24 / item.fundingIntervalHours) * 365 : null;
       const rowClass = isBlacklisted ? 'row-blacklisted' : '';
       const blacklistActionLabel = isBlacklisted ? '恢复' : '拉黑';
       const blacklistActionTitle = isBlacklisted ? '移出黑名单' : '加入黑名单';
+      const alphaContracts = Array.isArray(item.alphaContracts) ? item.alphaContracts.filter(x => x && x.contractAddress) : [];
+      const alphaContractLines = alphaContracts.map(x => `${'{'}x.chainName || x.chainId || '未知链'{'}'}:${'{'}x.contractAddress{'}'}`);
+      const alphaTitle = item.alphaChainLiquidity == null
+        ? '非 Binance Alpha 代币或暂无链上流动性'
+        : (alphaContractLines.join(' | ') || '未知链');
+      const alphaTooltipLines = alphaContractLines.length
+        ? alphaContractLines.map(line => `<span class="alpha-tooltip-line">${'{'}escapeHtml(line){'}'}</span>`).join('')
+        : `<span class="alpha-tooltip-line">${'{'}escapeHtml(alphaTitle){'}'}</span>`;
+      const alphaTooltip = item.alphaChainLiquidity == null
+        ? ''
+        : `<span class="alpha-tooltip-bubble">${'{'}alphaTooltipLines{'}'}</span>`;
+      const alphaCellInner = item.alphaChainLiquidity == null
+        ? toNumFixed(alphaLiquidityDisplay, 2)
+        : (item.alphaPageUrl
+          ? `<a class="alpha-link" href="${'{'}item.alphaPageUrl{'}'}" target="_blank" rel="noopener noreferrer">${'{'}toNumFixed(alphaLiquidityDisplay, 2){'}'}</a>`
+          : toNumFixed(alphaLiquidityDisplay, 2));
       return `
         <tr class="${'{'}rowClass{'}'}">
           <td><span class="tag">${'{'}exchangeLabel(item.exchange){'}'}</span></td>
@@ -2764,6 +3038,8 @@ def _render_html(*, static_payload_json: str) -> str:
             </div>
           </td>
           <td class="num">${'{'}formatMarkPrice(item.markPrice){'}'}</td>
+          <td class="num">${'{'}toNumFixed(turnoverDisplay, 2){'}'}</td>
+          <td class="num alpha-tooltip-cell">${'{'}alphaCellInner{'}'}${'{'}alphaTooltip{'}'}</td>
           <td class="num">${'{'}toNumFixed(notionalDisplay, 2){'}'}</td>
           <td class="num">${'{'}toNumFixed(insuranceDisplay, 2){'}'}</td>
           <td class="num"><div class="stack"><span class="${'{'}classFor(item.lastFundingRate){'}'}">${'{'}toPct(item.lastFundingRate){'}'}</span><span class="mini ${'{'}classFor(latestAnn){'}'}">APR ${'{'}toPctFixed(latestAnn, 2){'}'}</span></div></td>

@@ -274,11 +274,15 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             lastFundingRate TEXT,
             openInterest TEXT,
             insuranceBalance TEXT,
+            volume24h TEXT,
+            turnover24h TEXT,
             updated_at INTEGER
         )
         """
     )
     ensure_column(conn, TABLE_NAME, "insuranceBalance", "TEXT")
+    ensure_column(conn, TABLE_NAME, "volume24h", "TEXT")
+    ensure_column(conn, TABLE_NAME, "turnover24h", "TEXT")
     conn.commit()
 
 
@@ -300,9 +304,10 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
         f"""
         INSERT INTO {TABLE_NAME} (
             symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
-            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance, updated_at
+            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance,
+            volume24h, turnover24h, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             adjustedFundingRateCap=excluded.adjustedFundingRateCap,
             adjustedFundingRateFloor=excluded.adjustedFundingRateFloor,
@@ -311,6 +316,8 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
             lastFundingRate=excluded.lastFundingRate,
             openInterest=excluded.openInterest,
             insuranceBalance=excluded.insuranceBalance,
+            volume24h=excluded.volume24h,
+            turnover24h=excluded.turnover24h,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -386,6 +393,8 @@ def main() -> None:
                     last_funding_rate,
                     oi_value,
                     insurance_by_symbol.get(sym),
+                    to_plain_str(ticker.get("volume24h")),
+                    to_plain_str(ticker.get("turnover24h")),
                     now_ms,
                 )
             )

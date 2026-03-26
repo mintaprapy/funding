@@ -19,6 +19,8 @@ BASEINFO_NUMERIC_SHADOW_COLUMNS: dict[str, str] = {
     "lastFundingRate": "lastFundingRateNum",
     "openInterest": "openInterestNum",
     "insuranceBalance": "insuranceBalanceNum",
+    "volume24h": "volume24hNum",
+    "turnover24h": "turnover24hNum",
 }
 HISTORY_NUMERIC_SHADOW_COLUMNS: dict[str, str] = {
     "fundingRate": "fundingRateNum",
@@ -265,11 +267,15 @@ def ensure_baseinfo_table(conn: sqlite3.Connection, table: str) -> None:
             lastFundingRate TEXT,
             openInterest TEXT,
             insuranceBalance TEXT,
+            volume24h TEXT,
+            turnover24h TEXT,
             updated_at INTEGER
         )
         """
     )
     ensure_column(conn, table, "insuranceBalance", "TEXT")
+    ensure_column(conn, table, "volume24h", "TEXT")
+    ensure_column(conn, table, "turnover24h", "TEXT")
     ensure_baseinfo_numeric_layout(conn, table)
     conn.commit()
 

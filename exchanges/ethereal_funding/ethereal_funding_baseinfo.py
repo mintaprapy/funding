@@ -138,14 +138,26 @@ def _extract_cap_floor(item: dict[str, Any]) -> tuple[str | None, str | None]:
     return cap, floor
 
 
+def _mul_plain_values(left: Any, right: Any) -> str | None:
+    left_plain = to_plain_str(left)
+    right_plain = to_plain_str(right)
+    if left_plain is None or right_plain is None:
+        return None
+    try:
+        return to_plain_str(Decimal(left_plain) * Decimal(right_plain))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
 def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
     conn.executemany(
         f"""
         INSERT INTO {TABLE_NAME} (
             symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
-            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance, updated_at
+            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance,
+            volume24h, turnover24h, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             adjustedFundingRateCap=excluded.adjustedFundingRateCap,
             adjustedFundingRateFloor=excluded.adjustedFundingRateFloor,
@@ -154,6 +166,8 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
             lastFundingRate=excluded.lastFundingRate,
             openInterest=excluded.openInterest,
             insuranceBalance=excluded.insuranceBalance,
+            volume24h=excluded.volume24h,
+            turnover24h=excluded.turnover24h,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -180,16 +194,20 @@ def main() -> None:
                 continue
             price = prices.get(pid, {})
             cap, floor = _extract_cap_floor(product)
+            mark_price = to_plain_str(price.get("oraclePrice") or price.get("markPrice"))
+            volume_24h = to_plain_str(product.get("volume24h"))
             rows.append(
                 (
                     symbol,
                     cap,
                     floor,
                     DEFAULT_FUNDING_INTERVAL_HOURS,
-                    to_plain_str(price.get("oraclePrice") or price.get("markPrice")),
+                    mark_price,
                     to_plain_str(product.get("fundingRate1h")),
                     to_plain_str(product.get("openInterest")),
                     None,
+                    volume_24h,
+                    _mul_plain_values(volume_24h, mark_price),
                     now_ms,
                 )
             )

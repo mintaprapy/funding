@@ -25,6 +25,7 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.now_ms = 1_773_905_485_000
         self.orig_db_path = dashboard.DB_PATH
         self.orig_exchanges = dashboard.EXCHANGES
+        self.orig_alpha_enabled = dashboard.ALPHA_CHAIN_LIQUIDITY_ENABLED
         self.orig_alert_db_path = getattr(funding_alerts, "DB_PATH", None)
         dashboard.DB_PATH = self.db_path
         dashboard.EXCHANGES = {
@@ -37,6 +38,7 @@ class DashboardOptimizationTests(unittest.TestCase):
                 "allow_partial_window_sums": False,
             }
         }
+        dashboard.ALPHA_CHAIN_LIQUIDITY_ENABLED = False
         self._reset_dashboard_state()
         dashboard.initialize_dashboard_runtime(apply_legacy_migrations=True)
         self.addCleanup(self._cleanup)
@@ -44,6 +46,7 @@ class DashboardOptimizationTests(unittest.TestCase):
     def _cleanup(self) -> None:
         dashboard.DB_PATH = self.orig_db_path
         dashboard.EXCHANGES = self.orig_exchanges
+        dashboard.ALPHA_CHAIN_LIQUIDITY_ENABLED = self.orig_alpha_enabled
         if self.orig_alert_db_path is not None:
             funding_alerts.DB_PATH = self.orig_alert_db_path
         self._reset_dashboard_state()
@@ -64,6 +67,8 @@ class DashboardOptimizationTests(unittest.TestCase):
         dashboard._HISTORY_SUMS_CACHE_BATCH_COMPLETED_AT = None
         dashboard._HISTORY_SUMS_CACHE_ANCHOR_MS = None
         dashboard._HISTORY_SUMS_CACHE_WINDOWS_SIGNATURE = None
+        dashboard._ALPHA_CHAIN_LIQUIDITY_CACHE = None
+        dashboard._ALPHA_CHAIN_LIQUIDITY_CACHE_TS = 0.0
         dashboard._LEGACY_MIGRATIONS_PREPARED = False
 
     def _seed_demo_data(self) -> None:
@@ -76,9 +81,9 @@ class DashboardOptimizationTests(unittest.TestCase):
                 INSERT INTO demo_baseinfo (
                     symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
                     fundingIntervalHours, markPrice, lastFundingRate, openInterest,
-                    insuranceBalance, updated_at
+                    insuranceBalance, volume24h, turnover24h, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "BTC_USDT",
@@ -89,6 +94,8 @@ class DashboardOptimizationTests(unittest.TestCase):
                     "0.0025",
                     "2500000",
                     "150000",
+                    "880000",
+                    "123450000",
                     self.now_ms,
                 ),
             )
@@ -130,6 +137,8 @@ class DashboardOptimizationTests(unittest.TestCase):
         item = payload["items"][0]
         self.assertAlmostEqual(item["markPrice"], 123.45)
         self.assertAlmostEqual(item["lastFundingRate"], 0.0025)
+        self.assertAlmostEqual(item["volume24h"], 880000.0)
+        self.assertAlmostEqual(item["turnover24h"], 123450000.0)
         self.assertEqual(payload["exchangeFreshness"]["demo"]["status"], "fresh")
         self.assertIsNone(item["tradeUrl"])
 
@@ -190,6 +199,47 @@ class DashboardOptimizationTests(unittest.TestCase):
             self.assertEqual(calls, ["called"])
         finally:
             dashboard.normalize_legacy_units = original
+
+    def test_build_payload_attaches_binance_alpha_liquidity(self) -> None:
+        self._seed_demo_data()
+        dashboard.ALPHA_CHAIN_LIQUIDITY_ENABLED = True
+        with mock.patch.object(
+            dashboard,
+            "get_binance_alpha_liquidity_map",
+            return_value={
+                "BTC": {
+                    "alphaSymbol": "BTC",
+                    "alphaChainLiquidity": 987_654_321.0,
+                    "alphaChainNames": ["BSC", "Base"],
+                    "alphaPageUrl": "https://www.binance.com/zh-CN/alpha/bsc/0xabc",
+                    "alphaContracts": [
+                        {
+                            "chainId": "56",
+                            "chainName": "BSC",
+                            "contractAddress": "0xabc",
+                            "liquidity": 123.0,
+                        }
+                    ],
+                }
+            },
+        ):
+            payload = dashboard.build_payload(force_refresh=True, force_rebuild=True)
+        item = payload["items"][0]
+        self.assertEqual(item["alphaSymbol"], "BTC")
+        self.assertAlmostEqual(item["alphaChainLiquidity"], 987_654_321.0)
+        self.assertEqual(item["alphaChainNames"], ["BSC", "Base"])
+        self.assertEqual(item["alphaPageUrl"], "https://www.binance.com/zh-CN/alpha/bsc/0xabc")
+        self.assertEqual(
+            item["alphaContracts"],
+            [
+                {
+                    "chainId": "56",
+                    "chainName": "BSC",
+                    "contractAddress": "0xabc",
+                    "liquidity": 123.0,
+                }
+            ],
+        )
 
     def test_http_api_supports_gzip_etag_and_rebuild(self) -> None:
         self._seed_demo_data()
@@ -257,7 +307,7 @@ class DashboardOptimizationTests(unittest.TestCase):
     def test_trade_page_url_builders(self) -> None:
         self.assertEqual(
             dashboard.trade_page_url("binance", "BTCUSDT"),
-            "https://www.binance.com/en/futures/BTCUSDT",
+            "https://www.binance.com/zh-CN/futures/BTCUSDT",
         )
         self.assertEqual(
             dashboard.trade_page_url("backpack", "BTC_USDC_PERP"),
@@ -301,6 +351,23 @@ class DashboardOptimizationTests(unittest.TestCase):
         )
         self.assertIsNone(dashboard.trade_page_url("", "BTCUSDT"))
 
+    def test_alpha_symbol_for_market_variants(self) -> None:
+        self.assertEqual(dashboard.alpha_symbol_for_market("BTCUSDT"), "BTC")
+        self.assertEqual(dashboard.alpha_symbol_for_market("BTCUSD"), "BTC")
+        self.assertEqual(dashboard.alpha_symbol_for_market("BTC-USD"), "BTC")
+        self.assertEqual(dashboard.alpha_symbol_for_market("BTC_USDC_PERP"), "BTC")
+        self.assertEqual(dashboard.alpha_symbol_for_market("flx:CRCL"), "CRCL")
+
+    def test_alpha_chain_slug(self) -> None:
+        self.assertEqual(dashboard._alpha_chain_slug("BSC", "56"), "bsc")
+        self.assertEqual(dashboard._alpha_chain_slug("Base", "8453"), "base")
+        self.assertEqual(dashboard._alpha_chain_slug("Solana", "CT_501"), "solana")
+
+    def test_spot_listed_alpha_token_is_skipped(self) -> None:
+        self.assertTrue(dashboard._is_spot_listed_alpha_token({"listingCex": True}))
+        self.assertFalse(dashboard._is_spot_listed_alpha_token({"listingCex": False}))
+        self.assertFalse(dashboard._is_spot_listed_alpha_token({}))
+
     def test_render_html_contains_virtualized_table_markers(self) -> None:
         html = dashboard.render_html()
         self.assertIn("pollMetaAndRefresh", html)
@@ -315,6 +382,18 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertIn("exchangeFreshness", html)
         self.assertIn("symbol-link", html)
         self.assertIn("tradeUrl", html)
+        self.assertIn("alphaChainLiquidity", html)
+        self.assertIn("Alpha", html)
+        self.assertIn("alpha-link", html)
+        self.assertIn("turnover24h", html)
+        self.assertIn("24H成交额M", html)
+        self.assertIn("持仓量M", html)
+        self.assertIn("风险金M", html)
+        self.assertLess(html.index('data-key="markPrice"'), html.index('data-key="turnover24h"'))
+        self.assertLess(html.index('data-key="turnover24h"'), html.index('data-key="alphaChainLiquidity"'))
+        self.assertLess(html.index('data-key="alphaChainLiquidity"'), html.index('data-key="openInterestNotional"'))
+        self.assertLess(html.index('data-key="markPrice"'), html.index('data-key="turnover24h"'))
+        self.assertLess(html.index('data-key="turnover24h"'), html.index('data-key="openInterestNotional"'))
         self.assertIn("/api/alert-blacklist", html)
         self.assertNotIn("setAdminTokenBtn", html)
         self.assertNotIn("data-save-note-key", html)

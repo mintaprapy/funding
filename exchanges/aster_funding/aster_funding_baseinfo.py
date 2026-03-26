@@ -33,6 +33,7 @@ BASE_URL = (os.getenv("ASTER_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
 EXCHANGE_INFO_PATH = "/fapi/v1/exchangeInfo"
 FUNDING_INFO_PATH = "/fapi/v1/fundingInfo"
 PREMIUM_INDEX_PATH = "/fapi/v1/premiumIndex"
+TICKER_24H_PATH = "/fapi/v1/ticker/24hr"
 OPEN_INTEREST_PATH = "/fapi/v1/openInterest"
 INSURANCE_BALANCE_PATH = "/fapi/v1/insuranceBalance"
 REQUEST_TIMEOUT = 15
@@ -141,6 +142,21 @@ def get_premium_index() -> dict[str, dict[str, Any]]:
     return out
 
 
+def get_ticker_24h() -> dict[str, dict[str, Any]]:
+    base = require_base_url()
+    data = fetch_json(f"{base}{TICKER_24H_PATH}")
+    if not isinstance(data, list):
+        raise RuntimeError("ticker/24hr 返回格式异常")
+    out: dict[str, dict[str, Any]] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            out[symbol] = item
+    return out
+
+
 def get_open_interest(symbols: list[str]) -> dict[str, Any]:
     base = require_base_url()
     open_interest: dict[str, Any] = {}
@@ -199,11 +215,15 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             lastFundingRate TEXT,
             openInterest TEXT,
             insuranceBalance TEXT,
+            volume24h TEXT,
+            turnover24h TEXT,
             updated_at INTEGER
         )
         """
     )
     ensure_column(conn, TABLE_NAME, "insuranceBalance", "TEXT")
+    ensure_column(conn, TABLE_NAME, "volume24h", "TEXT")
+    ensure_column(conn, TABLE_NAME, "turnover24h", "TEXT")
     conn.commit()
 
 
@@ -225,9 +245,10 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
         f"""
         INSERT INTO {TABLE_NAME} (
             symbol, adjustedFundingRateCap, adjustedFundingRateFloor,
-            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance, updated_at
+            fundingIntervalHours, markPrice, lastFundingRate, openInterest, insuranceBalance,
+            volume24h, turnover24h, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             adjustedFundingRateCap=excluded.adjustedFundingRateCap,
             adjustedFundingRateFloor=excluded.adjustedFundingRateFloor,
@@ -236,6 +257,8 @@ def save_records(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
             lastFundingRate=excluded.lastFundingRate,
             openInterest=excluded.openInterest,
             insuranceBalance=excluded.insuranceBalance,
+            volume24h=excluded.volume24h,
+            turnover24h=excluded.turnover24h,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -252,6 +275,9 @@ def main() -> None:
 
     premium_index = get_premium_index()
     collector_log_progress("Aster", "base", detail="获取标记价格、最新资金费率")
+
+    ticker_24h = get_ticker_24h()
+    collector_log_progress("Aster", "base", detail="获取 24H 成交量、成交额")
 
     open_interest = get_open_interest(symbols)
     collector_log_progress("Aster", "base", detail="获取未平仓合约数")
@@ -313,6 +339,7 @@ def main() -> None:
     for sym in symbols:
         entry = funding_info.get(sym) or {}
         premium = premium_index.get(sym) or {}
+        ticker24 = ticker_24h.get(sym) or {}
         rows.append(
             (
                 sym,
@@ -323,6 +350,8 @@ def main() -> None:
                 to_plain_str(premium.get("lastFundingRate")),
                 to_plain_str(open_interest.get(sym)),
                 to_plain_str(insurance_by_symbol.get(sym)),
+                to_plain_str(ticker24.get("volume")),
+                to_plain_str(ticker24.get("quoteVolume")),
                 now_ms,
             )
         )
